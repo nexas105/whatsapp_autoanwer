@@ -113,6 +113,7 @@ export async function generateSummary({
   range_kind = 'last_n',
   range_value = '200',
   title = null,
+  model = 'opus',           // Summaries get the strong model — deep planning > speed.
 }) {
   const chat = repo.getChat(chatId);
   if (!chat) throw new Error('chat not found');
@@ -148,7 +149,7 @@ export async function generateSummary({
     + 'kein Vorwort, keine Code-Fences um das gesamte Dokument.',
   ].join('\n');
 
-  const md = String(await runAi(prompt, { timeoutMs: 180000 })).trim();
+  const md = String(await runAi(prompt, { timeoutMs: 180000, model })).trim();
   if (!md) throw new Error('AI gab leere Antwort');
 
   const fallbackTitle = `${tpl.name || 'Zusammenfassung'} — ${chat.name || chat.id} — `
@@ -164,4 +165,71 @@ export async function generateSummary({
     message_count: messages.length,
     chat_id: chatId,
   };
+}
+
+// Refresh OR refactor an existing summary.
+// - mode 'refresh': re-generate from scratch using the SAME settings (template,
+//   system_prompt, range). Replaces content_md. Use this when the chat has new
+//   messages and you want a fresh take.
+// - mode 'refactor': feed the existing content_md back to the AI as a base and
+//   ask it to UPDATE/REFINE in place, integrating new messages but preserving
+//   structure. Use this when you've already edited the summary and want to
+//   keep your edits while folding in new info.
+export async function regenerateSummary(summaryId, { mode = 'refresh', model = 'opus' } = {}) {
+  const existing = repo.getSummary(summaryId);
+  if (!existing) throw new Error('summary not found');
+
+  if (mode === 'refresh') {
+    const draft = await generateSummary({
+      chatId: existing.chat_id,
+      template: existing.template,
+      system_prompt: existing.system_prompt,
+      range_kind: existing.range_kind,
+      range_value: existing.range_value,
+      title: existing.title,
+      model,
+    });
+    return repo.updateSummary(summaryId, {
+      title: draft.title,
+      content_md: draft.content_md,
+    });
+  }
+
+  if (mode === 'refactor') {
+    const chat = repo.getChat(existing.chat_id);
+    if (!chat) throw new Error('chat not found');
+    const messages = selectMessages(existing.chat_id, existing.range_kind, existing.range_value);
+    if (!messages.length) throw new Error('keine Nachrichten im Bereich');
+    const transcript = fmtMessages(messages, !!chat.is_group);
+
+    const prompt = [
+      (existing.system_prompt || '').trim(),
+      '',
+      `Chat-Partner: ${chat.name || chat.id}${chat.is_group ? ' (Gruppe)' : ''}`,
+      `Anzahl Nachrichten: ${messages.length}`,
+      '',
+      'Du bekommst BESTEHENDES Markdown-Dokument und einen aktualisierten Chatverlauf.',
+      'Aufgabe: das Dokument INKREMENTELL verbessern — vorhandene Struktur, Sektionen',
+      'und gepflegte Inhalte respektieren, neue Erkenntnisse aus dem Verlauf integrieren,',
+      'überholte Informationen aktualisieren, fehlende Punkte ergänzen.',
+      'Schreibe das KOMPLETTE überarbeitete Markdown-Dokument zurück.',
+      '',
+      '--- Bestehendes Dokument ---',
+      String(existing.content_md || ''),
+      '--- /Bestehendes Dokument ---',
+      '',
+      '--- Aktualisierter Chatverlauf ---',
+      transcript,
+      '--- /Chatverlauf ---',
+      '',
+      'Antworte NUR mit dem überarbeiteten Markdown, kein Vorwort, keine Code-Fences ums gesamte Dokument.',
+    ].join('\n');
+
+    const md = String(await runAi(prompt, { timeoutMs: 180000, model })).trim();
+    if (!md) throw new Error('AI gab leere Antwort');
+
+    return repo.updateSummary(summaryId, { content_md: md });
+  }
+
+  throw new Error('mode must be refresh|refactor');
 }

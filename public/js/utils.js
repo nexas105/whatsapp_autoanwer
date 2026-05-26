@@ -58,6 +58,32 @@
       if (x < 1024 * 1024 * 1024) return `${(x / (1024 * 1024)).toFixed(1)} MB`;
       return `${(x / (1024 * 1024 * 1024)).toFixed(2)} GB`;
     },
+    // Formats a number with locale separators. Returns '0' for nullish.
+    formatNumber(n) {
+      const x = Number(n);
+      if (!Number.isFinite(x)) return '0';
+      try { return new Intl.NumberFormat('de-DE').format(x); }
+      catch (_) { return String(x); }
+    },
+    // Deterministic palette pick from a chat/contact id. Used for avatar tints.
+    avatarColor(id) {
+      const palette = [
+        '#0ea5e9', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6',
+        '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#a855f7',
+      ];
+      let h = 0;
+      const s = String(id || '');
+      for (let i = 0; i < s.length; i += 1) {
+        h = (h * 31 + s.charCodeAt(i)) | 0;
+      }
+      return palette[Math.abs(h) % palette.length];
+    },
+    // Convenience for the inline avatar tile style.
+    avatarStyle(id) {
+      const c = this.avatarColor(id);
+      // base hex + alpha suffix (~20%) for a subtle tinted background.
+      return `background-color: ${c}33; color: ${c};`;
+    },
     formatRelative(ts) {
       if (!ts) return '—';
       const ms = ts < 1e12 ? ts * 1000 : ts;
@@ -97,12 +123,33 @@
     // ───── toast + log ─────
     toast(msg, kind = 'info') {
       const id = ++this._toastId;
+      // Per-kind colors are applied via toastClasses() in the template.
       this.toasts.push({ id, msg, kind });
-      setTimeout(() => {
-        this.toasts = this.toasts.filter((t) => t.id !== id);
-      }, 2500);
+      // Cap visible toasts to 4 — drop the oldest if we go over.
+      while (this.toasts.length > 4) this.toasts.shift();
+      // Errors stay a bit longer than info/success messages.
+      const ttl = (kind === 'error') ? 4500 : (kind === 'warn' ? 3500 : 2500);
+      setTimeout(() => { this.dismissToast(id); }, ttl);
     },
     showToast(msg, kind = 'info') { return this.toast(msg, kind); },
+    dismissToast(id) {
+      this.toasts = this.toasts.filter((t) => t.id !== id);
+    },
+    toastClasses(kind) {
+      // Returns the per-kind Tailwind classes for the toast bubble.
+      switch (kind) {
+        case 'success':
+          return 'bg-emerald-900/90 border-emerald-600/60 text-emerald-50';
+        case 'warn':
+        case 'warning':
+          return 'bg-amber-900/90 border-amber-600/60 text-amber-50';
+        case 'error':
+          return 'bg-red-900/90 border-red-600/60 text-red-50';
+        case 'info':
+        default:
+          return 'bg-slate-800/95 border-slate-600/70 text-slate-100';
+      }
+    },
     pushLog(entry) {
       this.logs.push({
         level: entry.level || 'info',

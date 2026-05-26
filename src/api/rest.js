@@ -16,8 +16,9 @@ import { analyzeChat, composeFromPrompt, buildReplyPrompt } from '../cli/analysi
 import { bus, log, recentErrors } from '../events.js';
 import { transcribeFile, transcribeAvailable } from '../voice/transcribe.js';
 import { runAi } from '../cli/wrapper.js';
-import { generateSummary, TEMPLATES as SUMMARY_TEMPLATES } from '../cli/summaries.js';
+import { generateSummary, regenerateSummary, TEMPLATES as SUMMARY_TEMPLATES } from '../cli/summaries.js';
 import { renderPdf } from '../cli/pdf.js';
+import { computeBusyBlocks, computeFreeSlots, availabilitySummary } from '../calendar/availability.js';
 
 // Mirror of engine/reply-queue.js#splitVariants — keeps the regenerate endpoint
 // in sync with how the engine itself splits multi-variant AI output.
@@ -71,7 +72,7 @@ function safeFilename(name) {
     .slice(0, 120) || 'file';
 }
 
-export function buildRestRouter({ wa, engine, scheduler }) {
+export function buildRestRouter({ wa, engine, scheduler, calendarRefresher } = {}) {
   const router = express.Router();
   // Bumped slightly to accommodate base64-encoded uploads (up to ~25 MB binary
   // -> ~34 MB JSON payload; cap at 40mb to leave a little headroom).
@@ -80,11 +81,21 @@ export function buildRestRouter({ wa, engine, scheduler }) {
   // ---------- state / chats / messages ----------
 
   router.get('/state', (_req, res) => {
+    // Short cache: many WS clients also poll this on connect — 5s window
+    // dedupes the burst without making the dashboard feel stale.
+    res.set('Cache-Control', 'private, max-age=5');
     res.json({ wa: wa.getState(), engine: engine.status() });
   });
 
-  router.get('/chats', (_req, res) => {
-    res.json({ chats: repo.listChats({ limit: 200 }) });
+  // GET /api/chats?limit=&offset=
+  // Pagination is additive: omitting params yields the default 50 rows.
+  // limit is capped at 200 so a single request stays fast.
+  router.get('/chats', (req, res) => {
+    const limitRaw = Number(req.query.limit);
+    const offsetRaw = Number(req.query.offset);
+    const limit = Math.min(200, Math.max(1, Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : 50));
+    const offset = Math.max(0, Number.isFinite(offsetRaw) && offsetRaw >= 0 ? Math.floor(offsetRaw) : 0);
+    res.json({ chats: repo.listChats({ limit, offset }), limit, offset });
   });
 
   router.get('/chats/:id', (req, res) => {
@@ -94,11 +105,20 @@ export function buildRestRouter({ wa, engine, scheduler }) {
     res.json({ chat });
   });
 
+  // GET /api/chats/:id/messages?limit=&before_ts=
+  // Default: last `limit` messages (newest first), same as before.
+  // With ?before_ts=<ms>: cursor-based pagination — older messages
+  // strictly less than that timestamp, for infinite-scroll up.
   router.get('/chats/:id/messages', (req, res) => {
     const id = decodeId(req.params.id);
     const chat = repo.getChat(id);
     if (!chat) return res.status(404).json({ error: 'not found' });
-    const limit = Number(req.query.limit) || 50;
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 50));
+    const beforeRaw = req.query.before_ts;
+    const beforeTs = beforeRaw != null && beforeRaw !== '' ? Number(beforeRaw) : null;
+    if (beforeTs != null && Number.isFinite(beforeTs)) {
+      return res.json({ messages: repo.listMessagesBefore(id, beforeTs, { limit }) });
+    }
     res.json({ messages: repo.listMessages(id, { limit }) });
   });
 
@@ -216,6 +236,27 @@ export function buildRestRouter({ wa, engine, scheduler }) {
       }
       patch.never_to_ai = !!body.never_to_ai;
     }
+    if (body.schedule_assist_enabled !== undefined) {
+      if (typeof body.schedule_assist_enabled !== 'boolean'
+          && body.schedule_assist_enabled !== 0
+          && body.schedule_assist_enabled !== 1) {
+        return res.status(400).json({ error: 'schedule_assist_enabled must be a boolean' });
+      }
+      patch.schedule_assist_enabled = !!body.schedule_assist_enabled;
+    }
+    if (body.schedule_assist_template !== undefined) {
+      const v = String(body.schedule_assist_template);
+      if (!['free', '3_concrete_slots', 'ask_daytime', 'custom'].includes(v)) {
+        return res.status(400).json({ error: 'schedule_assist_template must be one of: free, 3_concrete_slots, ask_daytime, custom' });
+      }
+      patch.schedule_assist_template = v;
+    }
+    if (body.schedule_assist_prompt !== undefined) {
+      if (body.schedule_assist_prompt !== null && typeof body.schedule_assist_prompt !== 'string') {
+        return res.status(400).json({ error: 'schedule_assist_prompt must be a string or null' });
+      }
+      patch.schedule_assist_prompt = body.schedule_assist_prompt;
+    }
 
     let settings;
     try {
@@ -251,8 +292,19 @@ export function buildRestRouter({ wa, engine, scheduler }) {
 
   router.post('/chats/:id/analysis', async (req, res) => {
     const id = decodeId(req.params.id);
-    if (!repo.getChat(id)) return res.status(404).json({ error: 'chat not found' });
+    const chat = repo.getChat(id);
+    if (!chat) return res.status(404).json({ error: 'chat not found' });
     try {
+      // Cache: re-use the latest analysis when it's fresh (< 6h) AND no new
+      // messages have arrived since it was generated. Pass ?force=1 to bypass.
+      const force = req.query.force === '1' || req.query.force === 'true';
+      const recent = repo.latestAnalysis(id);
+      if (recent && !force) {
+        const age = Date.now() - recent.created_at;
+        if (age < 6 * 3600_000 && (chat?.last_message_at || 0) <= recent.created_at) {
+          return res.json({ analysis: recent, cached: true });
+        }
+      }
       const analysis = await analyzeChat(id);
       res.json({ analysis });
     } catch (err) {
@@ -316,7 +368,9 @@ export function buildRestRouter({ wa, engine, scheduler }) {
       if (count > 1) {
         prompt = `${prompt}\n\nGib genau ${count} alternative Antwortvarianten zurück. Trenne sie mit der Zeile ===.`;
       }
-      const raw = await runAi(prompt, { timeoutMs: 90000 });
+      // Haiku is 3-4× faster for short replies; sonnet stays default for full
+      // auto-replies which need higher quality.
+      const raw = await runAi(prompt, { timeoutMs: 90000, model: 'haiku' });
       const text = String(raw || '').trim();
       if (!text) return res.status(502).json({ error: 'AI returned empty' });
       let drafts;
@@ -752,6 +806,9 @@ export function buildRestRouter({ wa, engine, scheduler }) {
 
   router.get('/stats', (_req, res) => {
     try {
+      // Dashboard stats are aggregate counters refreshed every ~30s on the UI;
+      // a 15s private cache absorbs the WS-triggered refresh bursts.
+      res.set('Cache-Control', 'private, max-age=15');
       res.json({ stats: repo.getDashboardStats() });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -771,6 +828,9 @@ export function buildRestRouter({ wa, engine, scheduler }) {
 
   router.get('/charts', (_req, res) => {
     try {
+      // Charts run several COUNT(*) queries per call; the UI refreshes them
+      // every ~60s. 15s private cache eats burst calls from WS events.
+      res.set('Cache-Control', 'private, max-age=15');
       res.json({
         activity: repo.messagesPerHour(24),
         personas: repo.personaUsageStats(),
@@ -822,6 +882,8 @@ export function buildRestRouter({ wa, engine, scheduler }) {
   }
 
   router.get('/health', async (_req, res) => {
+    // Health must always reflect live state — never cache.
+    res.set('Cache-Control', 'no-store');
     // WhatsApp client state.
     let waInfo;
     try { waInfo = wa?.getState ? wa.getState() : { status: 'unknown' }; }
@@ -921,6 +983,9 @@ export function buildRestRouter({ wa, engine, scheduler }) {
 
   router.get('/personas', (_req, res) => {
     try {
+      // Personas change rarely; 5s private cache absorbs duplicate fetches
+      // (e.g. when several views mount around the same time).
+      res.set('Cache-Control', 'private, max-age=5');
       res.json({ personas: repo.listPersonas() });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -1820,6 +1885,11 @@ export function buildRestRouter({ wa, engine, scheduler }) {
       return res.status(400).json({ error: String(err.message || err) });
     }
     try {
+      // Model override: client kann 'opus'|'sonnet'|'haiku' senden; default Opus.
+      const allowedModels = new Set(['opus', 'sonnet', 'haiku']);
+      const model = body.model && allowedModels.has(String(body.model))
+        ? String(body.model)
+        : 'opus';
       const draft = await generateSummary({
         chatId: body.chat_id,
         template: body.template,
@@ -1827,6 +1897,7 @@ export function buildRestRouter({ wa, engine, scheduler }) {
         range_kind: range.range_kind,
         range_value: range.range_value,
         title: body.title,
+        model,
       });
       const saved = repo.insertSummary({ ...draft, folder_id: body.folder_id ?? null });
       bus.emit('summary', { action: 'created', summary: saved });
@@ -1852,6 +1923,24 @@ export function buildRestRouter({ wa, engine, scheduler }) {
     if (!ok) return res.status(404).json({ error: 'not found' });
     bus.emit('summary', { action: 'deleted', id: Number(req.params.id) });
     res.json({ ok: true });
+  });
+
+  // Regenerate / refactor an existing summary.
+  // body: { mode: 'refresh'|'refactor', model?: 'opus'|'sonnet'|'haiku' }
+  router.post('/summaries/:id/regenerate', async (req, res) => {
+    const body = req.body || {};
+    const mode = body.mode === 'refactor' ? 'refactor' : 'refresh';
+    const allowedModels = new Set(['opus', 'sonnet', 'haiku']);
+    const model = body.model && allowedModels.has(String(body.model)) ? String(body.model) : 'opus';
+    try {
+      const updated = await regenerateSummary(req.params.id, { mode, model });
+      bus.emit('summary', { action: 'updated', summary: updated });
+      res.json({ summary: updated, mode });
+    } catch (err) {
+      const msg = String(err.message || err);
+      const status = msg.includes('not found') ? 404 : 500;
+      res.status(status).json({ error: msg });
+    }
   });
 
   router.get('/summaries/:id/download.md', (req, res) => {
@@ -1899,6 +1988,266 @@ export function buildRestRouter({ wa, engine, scheduler }) {
     if (!ok) return res.status(404).json({ error: 'not found' });
     bus.emit('summary_folder', { action: 'deleted', id: Number(req.params.id) });
     res.json({ ok: true });
+  });
+
+  // ---------- calendar sources + appointments ----------
+
+  router.get('/calendar/sources', (_req, res) => {
+    try { res.json({ sources: repo.listCalendarSources() }); }
+    catch (err) { res.status(500).json({ error: String(err) }); }
+  });
+
+  router.get('/calendar/sources/:id', (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const source = repo.getCalendarSource(id);
+    if (!source) return res.status(404).json({ error: 'not found' });
+    res.json({ source });
+  });
+
+  router.post('/calendar/sources', async (req, res) => {
+    const body = req.body || {};
+    if (!body.name || typeof body.name !== 'string' || !body.name.trim()) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+    if (!body.ical_url || typeof body.ical_url !== 'string' || !body.ical_url.trim()) {
+      return res.status(400).json({ error: 'ical_url is required' });
+    }
+    if (body.color !== undefined && body.color !== null && typeof body.color !== 'string') {
+      return res.status(400).json({ error: 'color must be a string or null' });
+    }
+    try {
+      const source = repo.insertCalendarSource({
+        name: body.name,
+        ical_url: body.ical_url,
+        color: body.color ?? null,
+        enabled: body.enabled !== false,
+      });
+      bus.emit('calendar_source', { action: 'created', source });
+      // Trigger an immediate fetch (async).
+      if (calendarRefresher && typeof calendarRefresher.refreshNow === 'function') {
+        Promise.resolve().then(() => calendarRefresher.refreshNow(source.id))
+          .catch((err) => log('warn', 'initial calendar fetch failed', { id: source.id, error: String(err) }));
+      }
+      res.json({ source });
+    } catch (err) {
+      res.status(400).json({ error: String(err.message || err) });
+    }
+  });
+
+  router.put('/calendar/sources/:id', (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const body = req.body || {};
+    try {
+      const source = repo.updateCalendarSource(id, body);
+      bus.emit('calendar_source', { action: 'updated', source });
+      res.json({ source });
+    } catch (err) {
+      const msg = String(err.message || err);
+      const code = /not found/i.test(msg) ? 404 : 400;
+      res.status(code).json({ error: msg });
+    }
+  });
+
+  router.delete('/calendar/sources/:id', (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    try {
+      const ok = repo.deleteCalendarSource(id);
+      if (!ok) return res.status(404).json({ error: 'not found' });
+      bus.emit('calendar_source', { action: 'deleted', id });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  router.post('/calendar/sources/:id/refresh', async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    if (!calendarRefresher || typeof calendarRefresher.refreshNow !== 'function') {
+      return res.status(503).json({ error: 'calendar refresher unavailable' });
+    }
+    try {
+      await calendarRefresher.refreshNow(id);
+      const source = repo.getCalendarSource(id);
+      res.json({ source });
+    } catch (err) {
+      res.status(500).json({ error: String(err.message || err) });
+    }
+  });
+
+  router.get('/calendar/availability', (req, res) => {
+    const days = Math.max(1, Math.min(60, Number(req.query.days) || 14));
+    const dayStart = String(req.query.dayStart || '09:00');
+    const dayEnd = String(req.query.dayEnd || '21:00');
+    try {
+      const now = Date.now();
+      const startOfToday = (() => { const d = new Date(now); d.setHours(0, 0, 0, 0); return d.getTime(); })();
+      const from = startOfToday;
+      const to = from + days * 24 * 3600 * 1000;
+      const busy = computeBusyBlocks({ from, to });
+      const free = computeFreeSlots({ from, to, dayStart, dayEnd, slotMin: 60 });
+      const summary = availabilitySummary({ days, dayStart, dayEnd });
+      res.json({ busy, free, summary, from, to });
+    } catch (err) {
+      res.status(500).json({ error: String(err.message || err) });
+    }
+  });
+
+  // ---------- appointments ----------
+
+  router.get('/appointments', (req, res) => {
+    const chatId = req.query.chat_id ? decodeId(String(req.query.chat_id)) : null;
+    const sinceTs = req.query.since != null ? Number(req.query.since) : null;
+    const untilTs = req.query.until != null ? Number(req.query.until) : null;
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
+    try {
+      const appointments = repo.listAppointments({ chatId, sinceTs, untilTs, limit });
+      res.json({ appointments });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  router.get('/appointments/:id', (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const appointment = repo.getAppointment(id);
+    if (!appointment) return res.status(404).json({ error: 'not found' });
+    res.json({ appointment });
+  });
+
+  router.post('/appointments', (req, res) => {
+    const body = req.body || {};
+    if (!body.chat_id || typeof body.chat_id !== 'string') {
+      return res.status(400).json({ error: 'chat_id is required' });
+    }
+    if (!body.title || typeof body.title !== 'string') {
+      return res.status(400).json({ error: 'title is required' });
+    }
+    const startTs = Number(body.start_ts);
+    const endTs = Number(body.end_ts);
+    if (!Number.isFinite(startTs)) return res.status(400).json({ error: 'start_ts required' });
+    if (!Number.isFinite(endTs) || endTs <= startTs) return res.status(400).json({ error: 'end_ts must be > start_ts' });
+    try {
+      const appointment = repo.insertAppointment({
+        chatId: body.chat_id,
+        title: body.title,
+        notes: body.notes ?? null,
+        start_ts: startTs,
+        end_ts: endTs,
+        status: body.status || 'confirmed',
+      });
+      bus.emit('appointment', { action: 'created', appointment });
+      res.json({ appointment });
+    } catch (err) {
+      res.status(400).json({ error: String(err.message || err) });
+    }
+  });
+
+  router.put('/appointments/:id', (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const body = req.body || {};
+    const patch = {};
+    if (body.title !== undefined) patch.title = body.title;
+    if (body.notes !== undefined) patch.notes = body.notes;
+    if (body.start_ts !== undefined) patch.start_ts = Number(body.start_ts);
+    if (body.end_ts !== undefined) patch.end_ts = Number(body.end_ts);
+    if (body.status !== undefined) patch.status = String(body.status);
+    try {
+      const appointment = repo.updateAppointment(id, patch);
+      bus.emit('appointment', { action: 'updated', appointment });
+      res.json({ appointment });
+    } catch (err) {
+      const msg = String(err.message || err);
+      const code = /not found/i.test(msg) ? 404 : 400;
+      res.status(code).json({ error: msg });
+    }
+  });
+
+  router.delete('/appointments/:id', (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    try {
+      const ok = repo.deleteAppointment(id);
+      if (!ok) return res.status(404).json({ error: 'not found' });
+      bus.emit('appointment', { action: 'deleted', id });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // ── .ics generation ──────────────────────────────────────────────
+  function pad2(n) { return String(n).padStart(2, '0'); }
+  function fmtIcsDateUtc(ts) {
+    const d = new Date(ts);
+    return `${d.getUTCFullYear()}${pad2(d.getUTCMonth() + 1)}${pad2(d.getUTCDate())}`
+      + `T${pad2(d.getUTCHours())}${pad2(d.getUTCMinutes())}${pad2(d.getUTCSeconds())}Z`;
+  }
+  function escapeIcs(s) {
+    return String(s || '').replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\n/g, '\\n');
+  }
+  function buildIcsEvent(a) {
+    const uid = `appt-${a.id}@whatsapp-autoanswer`;
+    const lines = [
+      'BEGIN:VEVENT',
+      `UID:${uid}`,
+      `DTSTAMP:${fmtIcsDateUtc(Date.now())}`,
+      `DTSTART:${fmtIcsDateUtc(a.start_ts)}`,
+      `DTEND:${fmtIcsDateUtc(a.end_ts)}`,
+      `SUMMARY:${escapeIcs(a.title)}`,
+    ];
+    if (a.notes) lines.push(`DESCRIPTION:${escapeIcs(a.notes)}`);
+    if (a.status === 'tentative') lines.push('STATUS:TENTATIVE');
+    else if (a.status === 'cancelled') lines.push('STATUS:CANCELLED');
+    else lines.push('STATUS:CONFIRMED');
+    lines.push('END:VEVENT');
+    return lines.join('\r\n');
+  }
+  function buildIcsFile(events) {
+    return [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'PRODID:-//whatsapp-autoanswer//Calendar//EN',
+      'CALSCALE:GREGORIAN',
+      ...events.map(buildIcsEvent),
+      'END:VCALENDAR',
+    ].join('\r\n');
+  }
+
+  router.get('/appointments/:id/download.ics', (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const a = repo.getAppointment(id);
+    if (!a) return res.status(404).json({ error: 'not found' });
+    const ics = buildIcsFile([a]);
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="appointment-${a.id}.ics"`);
+    res.send(ics);
+  });
+
+  router.get('/appointments.ics', (req, res) => {
+    const sinceRaw = req.query.since;
+    const untilRaw = req.query.until;
+    const sinceTs = sinceRaw === 'now' ? Date.now() : (sinceRaw != null ? Number(sinceRaw) : Date.now() - 24 * 3600 * 1000);
+    const untilTs = untilRaw != null ? Number(untilRaw) : null;
+    try {
+      const appointments = repo.listAppointments({
+        sinceTs: Number.isFinite(sinceTs) ? sinceTs : null,
+        untilTs,
+        limit: 500,
+      });
+      const ics = buildIcsFile(appointments);
+      res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="appointments.ics"');
+      res.send(ics);
+    } catch (err) {
+      res.status(500).json({ error: String(err.message || err) });
+    }
   });
 
   return router;

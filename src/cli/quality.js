@@ -59,7 +59,9 @@ function safeJson(raw) {
 export async function rateReply(text, { context = '', timeoutMs = 30000 } = {}) {
   if (!text || !String(text).trim()) return null;
   try {
-    const raw = await runAi(buildRatingPrompt(text, context), { timeoutMs });
+    // Use Haiku: this is a tight JSON classification — Haiku is 3-4× faster
+    // and accuracy is sufficient for the bool/score schema below.
+    const raw = await runAi(buildRatingPrompt(text, context), { timeoutMs, model: 'haiku' });
     const parsed = safeJson(raw);
     if (!parsed) return null;
     return {

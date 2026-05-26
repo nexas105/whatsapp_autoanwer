@@ -16,6 +16,9 @@ export function getDb() {
   _db.exec(schema);
   migrate(_db);
   seedDefaultPersonas(_db);
+  // Perf: refresh planner statistics so newly-added indexes are actually used.
+  // ANALYZE is cheap on a sqlite DB of this size (<10ms typically).
+  try { _db.exec('ANALYZE'); } catch { /* non-fatal */ }
   return _db;
 }
 
@@ -85,11 +88,27 @@ function migrate(db) {
   if (!hasColumn(db, 'chat_settings', 'contact_bio_json')) {
     db.exec(`ALTER TABLE chat_settings ADD COLUMN contact_bio_json TEXT`);
   }
+  // v6: termin assistant (calendar-aware reply)
+  if (!hasColumn(db, 'chat_settings', 'schedule_assist_enabled')) {
+    db.exec(`ALTER TABLE chat_settings ADD COLUMN schedule_assist_enabled INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!hasColumn(db, 'chat_settings', 'schedule_assist_prompt')) {
+    db.exec(`ALTER TABLE chat_settings ADD COLUMN schedule_assist_prompt TEXT`);
+  }
+  if (!hasColumn(db, 'chat_settings', 'schedule_assist_template')) {
+    db.exec(`ALTER TABLE chat_settings ADD COLUMN schedule_assist_template TEXT NOT NULL DEFAULT 'free'`);
+  }
   // Seed empty user_profile row if missing
   const hasProfile = db.prepare(`SELECT 1 FROM user_profile WHERE id = 1`).get();
   if (!hasProfile) {
     db.prepare(`INSERT INTO user_profile (id, updated_at) VALUES (1, ?)`).run(Date.now());
   }
+  // Perf: composite index on chat_settings — referenced by listChats joins
+  // and the dashboard auto/persona counters. Safe to create only after the
+  // `suggestion_mode` column has been added by the migration above.
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_chat_settings_auto ON chat_settings(auto_reply, suggestion_mode)`);
+  } catch { /* column missing on very old DBs — ignore */ }
   // Backfill FTS index if it was just created (empty) but messages already exist.
   const ftsCount = db.prepare(`SELECT COUNT(*) AS n FROM messages_fts`).get().n;
   const msgCount = db.prepare(`SELECT COUNT(*) AS n FROM messages`).get().n;

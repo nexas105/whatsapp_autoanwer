@@ -15,6 +15,58 @@ import { synthesizeOpus } from '../voice/tts.js';
 import { config } from '../config.js';
 import { bus, log } from '../events.js';
 import { classifyRisk, decideSafety } from './safety.js';
+import { availabilitySummary } from '../calendar/availability.js';
+import { detectAndPersist, looksLikeConfirmation, offerHasDateTime, aiAvailable as calendarAiAvailable } from '../calendar/commit.js';
+
+// Templates expand into a short assist instruction appended to the prompt
+// after the calendar block. Keep the wording compact — they're stacked with
+// user-provided text for `custom`.
+const SCHEDULE_ASSIST_TEMPLATES = {
+  free:               '',
+  '3_concrete_slots': 'Schlage genau 3 konkrete Slots vor (Tag + Uhrzeit).',
+  ask_daytime:        'Frag zurück, ob Vormittag, Nachmittag oder Abend besser passt.',
+};
+
+// Build the calendar block appended to the AI prompt when schedule_assist is
+// enabled AND the incoming text hints at date/time talk. Returns '' when no
+// availability data is available so callers can decide to skip injection.
+function buildScheduleBlock(settings) {
+  const summary = availabilitySummary({ days: 14 });
+  if (!summary || !summary.trim()) return '';
+  const template = String(settings?.schedule_assist_template || 'free');
+  const customExtra = template === 'custom'
+    ? String(settings?.schedule_assist_prompt || '').trim()
+    : (SCHEDULE_ASSIST_TEMPLATES[template] || '');
+  const lines = [
+    '',
+    '--- Mein Kalender (nächste 14 Tage) ---',
+    summary,
+    '--- /Kalender ---',
+    '',
+  ];
+  if (customExtra) lines.push(customExtra, '');
+  lines.push('Schlage konkrete Termine aus meinen FREIEN Zeitfenstern vor. Niemals einen');
+  lines.push('belegten Slot vorschlagen.');
+  return lines.join('\n');
+}
+
+// Append the schedule-assist block immediately after `buildReplyPrompt` and
+// before its "Deine Antwort:" footer. Returns the augmented prompt — or the
+// original prompt unchanged when the gate isn't active.
+function maybeInjectScheduleAssist(prompt, settings, latestIncomingText) {
+  if (!settings || settings.schedule_assist_enabled !== 1) return prompt;
+  if (!latestIncomingText) return prompt;
+  if (typeof repo.hasDateTimeHint === 'function' && !repo.hasDateTimeHint(latestIncomingText)) {
+    return prompt;
+  }
+  const block = buildScheduleBlock(settings);
+  if (!block) return prompt;
+  // Insert the block just before the trailing "Deine Antwort:" footer.
+  if (/^Deine Antwort:\s*$/m.test(prompt)) {
+    return prompt.replace(/(\n*Deine Antwort:\s*)$/m, `\n${block}$1`);
+  }
+  return `${prompt.trimEnd()}\n${block}\n`;
+}
 
 // Decide whether the auto-reply for this chat should be sent as a voice note.
 function decideVoiceMode(chatId, settings) {
@@ -171,15 +223,42 @@ export function startEngine({ wa }) {
         const sessSettings = repo.getSettings(chatId);
         const sessMessages = repo.lastMessages(chatId, sessSettings.context_messages || 20);
         // Build the normal prompt and append the session goal at the end.
-        const base = buildReplyPrompt(sessChat, sessMessages, sessSettings);
+        let base = buildReplyPrompt(sessChat, sessMessages, sessSettings);
+        // Schedule-assist: inject calendar availability when the latest
+        // incoming text hints at date/time talk and the chat opted in.
+        const sessLatestIncoming = (() => {
+          for (let i = sessMessages.length - 1; i >= 0; i--) {
+            const m = sessMessages[i];
+            if (m.from_me === 1 || m.from_me === true) continue;
+            return (m.body && String(m.body).trim()) || (m.transcript && String(m.transcript).trim()) || '';
+          }
+          return '';
+        })();
+        base = maybeInjectScheduleAssist(base, sessSettings, sessLatestIncoming);
+        const turnNumber = session.turns_count + 1;
+        const remaining = Math.max(0, session.max_turns - session.turns_count);
+        // Pacing-Hinweis je nach Resttagets: AI soll bewusst wrappen statt
+        // abrupt am Limit abgewürgt zu werden.
+        let pacing;
+        if (remaining <= 1) {
+          pacing = 'LETZTE NACHRICHT: Das ist deine FINALE Nachricht in dieser Session. Schließe das Gespräch sauber ab — falls das Ziel erreicht ist beende mit DONE, sonst gib einen klaren, höflichen Abschluss (z.B. "okay melde mich später nochmal" oder eine konkrete Zusage).';
+        } else if (remaining <= 3) {
+          pacing = `Endphase (noch ${remaining} Turns übrig): Steuere jetzt aktiv auf einen Abschluss zu — konkreten Vorschlag machen, festnageln, oder elegant zu Ende bringen. Keine neuen Themen mehr.`;
+        } else if (remaining <= 5) {
+          pacing = `Späte Phase (${remaining} Turns übrig): vertiefe nicht weiter, sondern steuere Richtung konkretem Ergebnis (Termin, Zusage, klare Aussage).`;
+        } else {
+          pacing = `${remaining} Turns übrig — du hast noch Raum zum Aufbauen, aber bleib zielgerichtet.`;
+        }
         const goalBlock = [
           '',
           '--- Ziel dieser AI-Session ---',
           String(session.initial_prompt || '').trim(),
-          `(Versuch ${session.turns_count + 1} von ${session.max_turns}.)`,
           '--- /Ziel ---',
           '',
-          'Wenn das Ziel offensichtlich erreicht ist (z.B. eine Zusage, ein konkreter Termin), beende mit dem Wort: DONE',
+          `Turn ${turnNumber} von ${session.max_turns} (noch ${remaining} übrig).`,
+          pacing,
+          '',
+          'Wenn das Ziel offensichtlich erreicht ist (z.B. eine Zusage, ein konkreter Termin oder klares "passt"), beende mit dem Wort: DONE',
           'Sonst antworte ganz normal weiter Richtung Ziel.',
           '',
           'Deine Nachricht:',
@@ -240,7 +319,18 @@ export function startEngine({ wa }) {
 
       const chat = repo.getChat(chatId);
       const messages = repo.lastMessages(chatId, settings.context_messages);
-      const prompt = buildReplyPrompt(chat, messages, settings);
+      let prompt = buildReplyPrompt(chat, messages, settings);
+      // Schedule-assist: inject calendar availability when the latest
+      // incoming text hints at date/time talk and the chat opted in.
+      const latestIncomingText = (() => {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const m = messages[i];
+          if (m.from_me === 1 || m.from_me === true) continue;
+          return (m.body && String(m.body).trim()) || (m.transcript && String(m.transcript).trim()) || '';
+        }
+        return '';
+      })();
+      prompt = maybeInjectScheduleAssist(prompt, settings, latestIncomingText);
       const recent = repo.lastAutoReplies(chatId, 3);
 
       // ─── Suggestion-Mode branch ──────────────────────────────────────
@@ -253,7 +343,11 @@ export function startEngine({ wa }) {
           const fullPrompt = count > 1
             ? `${prompt}${extra}\n\nGib genau ${count} alternative Antwortvarianten zurück. Trenne sie mit der Zeile ===.`
             : `${prompt}${extra}`;
-          const raw = await runAi(fullPrompt);
+          // Multi-variant suggestion: use Haiku — 3-4× faster, and variant
+          // generation values breadth/speed over the last 5% of quality.
+          // Single-variant suggestion stays on the configured default.
+          const aiOpts = count > 1 ? { model: 'haiku' } : {};
+          const raw = await runAi(fullPrompt, aiOpts);
           if (!raw || !String(raw).trim()) return [];
           if (count === 1) return [String(raw).trim()];
           const parts = splitVariants(raw, count);
@@ -389,7 +483,13 @@ export function startEngine({ wa }) {
   function onIncoming(message) {
     if (!message) return;
     if (message.from_me === 1 || message.from_me === true) return;
-    if (message.type && message.type !== 'chat') return;
+    // Accept text, voice notes (ptt/audio — transcribed by whisper) and
+    // images (described by claude vision). We require a `text` payload
+    // below — `transcript` is populated for media by the voice/vision
+    // pipelines, so media without successful transcription is implicitly
+    // skipped.
+    const ACCEPTABLE_TYPES = new Set(['chat', 'ptt', 'audio', 'image', 'sticker', 'video', 'document']);
+    if (message.type && !ACCEPTABLE_TYPES.has(message.type)) return;
     const text = (message.body && String(message.body).trim())
       || (message.transcript && String(message.transcript).trim())
       || '';
@@ -400,6 +500,44 @@ export function startEngine({ wa }) {
 
     // Stories (status@broadcast) must never trigger an auto-reply.
     if (repo.isStatusChat(chatId)) return;
+
+    // ─── Commitment detection hook ────────────────────────────────────
+    // If the previous message was OURS, was auto-sent, and contained
+    // date/time keywords AND the incoming text looks like a confirmation,
+    // queue an async detectCommitment so we book the appointment.
+    try {
+      if (calendarAiAvailable()) {
+        const settingsForCommit = repo.getSettings(chatId);
+        if (settingsForCommit.schedule_assist_enabled === 1 && looksLikeConfirmation(text)) {
+          const recent = repo.lastMessages(chatId, 5) || [];
+          // Find the most recent OUR auto-sent message.
+          let lastBotReply = null;
+          for (let i = recent.length - 1; i >= 0; i--) {
+            const m = recent[i];
+            // skip the just-arrived message
+            if (m.id === message.id) continue;
+            if (m.from_me === 1 || m.from_me === true) {
+              if (m.is_auto === 1 || m.is_auto === true) {
+                const body = (m.body && String(m.body).trim()) || '';
+                if (body && offerHasDateTime(body)) lastBotReply = body;
+              }
+              break; // only consider the most recent outgoing
+            }
+          }
+          if (lastBotReply) {
+            // Fire-and-forget; failures are logged inside detectAndPersist.
+            Promise.resolve().then(() => detectAndPersist({
+              chatId,
+              lastBotReply,
+              lastIncoming: text,
+              messageId: message.id,
+            })).catch(() => { /* ignore */ });
+          }
+        }
+      }
+    } catch (err) {
+      log('warn', 'commit detection hook failed', { chatId, error: String(err) });
+    }
 
     // ─── AI-Session gate: when a session is active for this chat, route the
     // ─── incoming message through the session path and skip the rest.

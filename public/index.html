@@ -11,6 +11,7 @@
     <script src="/js/utils.js"></script>
     <script src="/js/views.js"></script>
     <script src="/js/summaries.js"></script>
+    <script src="/js/shortcuts.js"></script>
     <!-- app.js MUST load before Alpine, so `app()` exists when Alpine evaluates x-data -->
     <script src="/app.js"></script>
     <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
@@ -43,6 +44,27 @@
       .switch-lg input:checked + .slider::before { transform: translateX(22px); }
       /* Drag-over highlight */
       .drag-over { outline: 2px dashed #10b981; outline-offset: -6px; background: rgba(16,185,129,0.06); }
+      /* Skeleton placeholders (use with Tailwind's `animate-pulse`) */
+      .sk { background: linear-gradient(90deg, rgba(148,163,184,0.10) 0%, rgba(148,163,184,0.20) 50%, rgba(148,163,184,0.10) 100%); border-radius: 6px; }
+      .sk-dark { background: rgba(51,65,85,0.55); border-radius: 6px; }
+      .sk-line { height: 0.75rem; border-radius: 4px; }
+      /* Keyboard cap (used in cheatsheet) */
+      kbd.kc {
+        display: inline-flex; align-items: center; justify-content: center;
+        min-width: 1.5rem; padding: 0 0.4rem; height: 1.4rem;
+        font: 600 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: #1f2937; color: #e2e8f0;
+        border: 1px solid #334155; border-bottom-width: 2px;
+        border-radius: 0.35rem;
+      }
+      /* Toast slide-in (used as Alpine x-transition fallback) */
+      @keyframes toast-in {
+        from { transform: translateX(120%); opacity: 0; }
+        to   { transform: translateX(0);    opacity: 1; }
+      }
+      .toast-enter { animation: toast-in 0.18s cubic-bezier(.2,.7,.3,1) both; }
+      /* Mobile-drawer backdrop */
+      .drawer-backdrop { background: rgba(2, 6, 23, 0.55); backdrop-filter: blur(1px); }
       /* Range slider */
       input[type=range].style-range { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; background: #334155; border-radius: 9999px; outline: none; }
       input[type=range].style-range::-webkit-slider-thumb {
@@ -201,16 +223,41 @@
                         x-text="f"></button>
               </template>
             </div>
-            <div class="flex-1 overflow-y-auto scroll-pane">
-              <template x-if="filteredChats().length === 0">
-                <div class="p-6 text-center text-sm text-slate-500">Keine Chats vorhanden.</div>
+            <div class="flex-1 overflow-y-auto scroll-pane"
+                 @scroll.throttle.250ms="onChatsScroll($event)">
+              <!-- Skeleton placeholder while loading the very first batch. -->
+              <template x-if="chats.length === 0 && chatsLoading">
+                <div class="animate-pulse">
+                  <template x-for="i in 6" :key="i">
+                    <div class="px-4 py-3 border-b border-slate-800/60 flex items-start gap-3">
+                      <div class="w-10 h-10 rounded-full sk-dark shrink-0"></div>
+                      <div class="flex-1 space-y-2 min-w-0">
+                        <div class="flex items-center justify-between gap-2">
+                          <div class="sk-line w-2/5"></div>
+                          <div class="sk-line w-10"></div>
+                        </div>
+                        <div class="sk-line w-4/5"></div>
+                        <div class="sk-line w-1/3"></div>
+                      </div>
+                    </div>
+                  </template>
+                </div>
+              </template>
+              <template x-if="!chatsLoading && filteredChats().length === 0">
+                <div class="p-8 text-center">
+                  <div class="text-4xl mb-2 opacity-70">💬</div>
+                  <div class="text-base font-medium text-slate-300">Noch nichts hier</div>
+                  <div class="text-xs text-slate-500 mt-1 leading-snug">
+                    Sobald jemand schreibt oder du Chats synchronisiert hast, erscheinen sie an dieser Stelle.
+                  </div>
+                </div>
               </template>
               <template x-for="c in filteredChats()" :key="c.id">
                 <div @click="selectChat(c.id)"
                      class="px-4 py-3 border-b border-slate-800/60 cursor-pointer hover:bg-slate-800/40 transition flex items-start gap-3"
                      :class="{ 'bg-slate-800/60': selectedChatId === c.id }">
-                  <div class="w-10 h-10 rounded-full bg-slate-700 text-slate-200 flex items-center justify-center text-sm font-medium shrink-0 relative"
-                       >
+                  <div class="w-10 h-10 rounded-full flex items-center justify-center text-sm font-semibold shrink-0 relative"
+                       :style="avatarStyle(c.id)">
                     <span x-text="initials(c)"></span>
                     <span x-show="(c.messages_24h || 0) > 0"
                           class="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-400 border-2 border-slate-950"></span>
@@ -265,8 +312,28 @@
           <section class="flex-1 flex-col min-w-0 bg-slate-900"
                    :class="selectedChatId ? 'flex' : 'hidden md:flex'">
             <template x-if="!selectedChatId">
-              <div class="flex-1 hidden md:flex items-center justify-center text-slate-500">
-                Wähle einen Chat aus der Liste.
+              <div class="flex-1 hidden md:flex items-center justify-center p-6">
+                <div class="text-center max-w-md">
+                  <div class="text-5xl mb-3 opacity-70">💬</div>
+                  <div class="text-lg font-semibold text-slate-200">Kein Chat ausgewählt</div>
+                  <div class="text-sm text-slate-400 mt-1 leading-relaxed">
+                    Wähle links einen Chat aus oder benutze die Schnellzugriffe.
+                  </div>
+                  <div class="mt-5 inline-flex flex-col gap-1.5 text-xs text-slate-400">
+                    <div class="flex items-center gap-2 justify-center">
+                      <kbd class="kc" x-text="(navigator.platform || '').toLowerCase().includes('mac') ? '⌘' : 'Ctrl'"></kbd>
+                      <span>+</span><kbd class="kc">K</kbd>
+                      <span>Suche öffnen</span>
+                    </div>
+                    <div class="flex items-center gap-2 justify-center">
+                      <kbd class="kc">g</kbd><span>dann</span><kbd class="kc">i</kbd>
+                      <span>Inbox öffnen</span>
+                    </div>
+                    <div class="flex items-center gap-2 justify-center">
+                      <kbd class="kc">?</kbd><span>alle Tastaturkürzel anzeigen</span>
+                    </div>
+                  </div>
+                </div>
               </div>
             </template>
 
@@ -274,12 +341,17 @@
               <div class="flex-1 flex min-h-0">
                 <!-- Middle column: messages -->
                 <div class="flex-1 flex flex-col min-w-0">
-                  <!-- Chat header -->
-                  <div class="px-3 md:px-5 py-3 border-b border-slate-800 flex items-center gap-2 shrink-0">
+                  <!-- Chat header (sticky on mobile so back/hamburger are always reachable) -->
+                  <div class="px-3 md:px-5 py-3 border-b border-slate-800 flex items-center gap-2 shrink-0 sticky top-0 z-10 bg-slate-900/95 backdrop-blur-sm md:static md:bg-transparent md:backdrop-blur-0">
                     <!-- Mobile back button -->
                     <button @click="selectedChatId = null"
-                            class="md:hidden text-slate-400 hover:text-slate-200 text-lg px-1"
-                            title="Zurück zur Chatliste">‹</button>
+                            class="md:hidden text-slate-400 hover:text-slate-200 text-2xl leading-none px-1"
+                            title="Zurück zur Chatliste"
+                            aria-label="Zurück">‹</button>
+                    <!-- Avatar (mobile compact, helps identify which chat is open) -->
+                    <div class="md:hidden w-8 h-8 rounded-full flex items-center justify-center text-xs font-semibold shrink-0"
+                         :style="avatarStyle(selectedChatId)"
+                         x-text="initials(selectedChat())"></div>
                     <div class="min-w-0 flex-1">
                       <div class="font-semibold truncate" x-text="displayName(selectedChat())"></div>
                       <div class="text-xs text-slate-500 truncate" x-text="selectedChatId"></div>
@@ -331,10 +403,29 @@
                            @dragover.prevent="dragHover = true"
                            @dragleave.prevent="dragHover = false"
                            @drop.prevent="handleDrop($event)"
+                           @scroll.throttle.200ms="onMessagesScroll($event)"
                            :class="dragHover ? 'drag-over' : ''"
                            class="flex-1 overflow-y-auto scroll-pane px-4 py-4 space-y-2 transition">
-                        <template x-if="messages.length === 0">
-                          <div class="text-center text-slate-500 text-sm py-8">Noch keine Nachrichten.</div>
+                        <!-- Skeleton bubbles while loading first page of messages. -->
+                        <template x-if="messages.length === 0 && messagesLoading">
+                          <div class="space-y-3 animate-pulse">
+                            <template x-for="i in 5" :key="i">
+                              <div class="flex" :class="(i % 2 === 0) ? 'justify-end' : 'justify-start'">
+                                <div class="max-w-[55%] sk-dark px-3 py-2 rounded-lg"
+                                     :class="(i % 2 === 0) ? 'rounded-br-sm' : 'rounded-bl-sm'">
+                                  <div class="sk-line w-32 mb-1.5"></div>
+                                  <div class="sk-line w-48"></div>
+                                </div>
+                              </div>
+                            </template>
+                          </div>
+                        </template>
+                        <template x-if="!messagesLoading && messages.length === 0">
+                          <div class="text-center py-10">
+                            <div class="text-4xl mb-2 opacity-70">💬</div>
+                            <div class="text-base font-medium text-slate-300">Noch keine Nachrichten</div>
+                            <div class="text-xs text-slate-500 mt-1">Schreibe unten eine Nachricht oder lade den Verlauf nach.</div>
+                          </div>
                         </template>
                         <template x-for="m in messages" :key="m.id">
                           <div class="flex" :class="m.from_me ? 'justify-end' : 'justify-start'">
@@ -620,7 +711,9 @@
                         </button>
                         <input type="text" x-model="composeText"
                                @keydown.enter.prevent="sendMessage()"
-                               placeholder="Nachricht schreiben…"
+                               @keydown.meta.enter.prevent="sendMessage()"
+                               @keydown.ctrl.enter.prevent="sendMessage()"
+                               placeholder="Nachricht schreiben… (⌘/Ctrl+Enter zum Senden)"
                                class="flex-1 bg-slate-800 border border-slate-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
                         <button @click="sendMessage()"
                                 :disabled="!composeText.trim() || sending"
@@ -682,9 +775,13 @@
                   </template>
                 </div>
 
+                <!-- Mobile backdrop when right drawer is open -->
+                <div x-show="chatSidebarOpen" x-transition.opacity
+                     class="md:hidden fixed inset-0 z-20 drawer-backdrop"
+                     @click="chatSidebarOpen = false" x-cloak></div>
                 <!-- Right column: settings + analysis — drawer on mobile, sidebar on desktop -->
                 <div class="border-l border-slate-800 bg-slate-950/40 flex flex-col"
-                     :class="chatSidebarOpen ? 'fixed md:relative inset-y-0 right-0 z-30 w-80 max-w-[90vw] shadow-2xl md:shadow-none md:w-80 md:shrink-0 flex' : 'hidden md:flex md:w-80 md:shrink-0'">
+                     :class="chatSidebarOpen ? 'fixed md:relative inset-y-0 right-0 top-0 bottom-0 z-30 w-[85vw] max-w-md shadow-2xl md:shadow-none md:w-80 md:shrink-0 flex' : 'hidden md:flex md:w-80 md:shrink-0'">
                   <!-- Mobile drawer close button -->
                   <button @click="chatSidebarOpen = false"
                           class="md:hidden absolute top-2 right-2 z-10 w-8 h-8 rounded-md bg-slate-800/70 hover:bg-slate-700 text-slate-300"
@@ -1069,7 +1166,8 @@
                     <template x-if="profile">
                       <div class="space-y-3">
                         <div class="flex items-center gap-3">
-                          <div class="w-10 h-10 rounded-full bg-slate-700 text-slate-200 flex items-center justify-center font-semibold text-sm"
+                          <div class="w-10 h-10 rounded-full flex items-center justify-center font-semibold text-sm"
+                               :style="avatarStyle(profile.chat?.id)"
                                x-text="initials(profile.chat)"></div>
                           <div class="flex-1 min-w-0">
                             <div class="font-medium truncate" x-text="profile.chat?.name || profile.chat?.id"></div>
@@ -1227,6 +1325,50 @@
                     </div>
                     <!-- end accordion: privacy -->
 
+                    <!-- ACCORDION: schedule_assist (Termin-Assistent) -->
+                    <div class="border-b border-slate-800">
+                      <button @click="toggleSettingsSection('schedule_assist')"
+                              class="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-slate-900/40">
+                        <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-300">📅 Termin-Assistent</h3>
+                        <span class="text-slate-400 text-xs" x-text="openSettingsSection === 'schedule_assist' ? '▾' : '▸'"></span>
+                      </button>
+                      <div x-show="openSettingsSection === 'schedule_assist'" class="px-4 pb-4">
+                        <div class="space-y-3">
+                          <label class="flex items-center justify-between gap-3 text-sm">
+                            <span class="leading-snug">
+                              <span class="font-medium">Aktiviert</span>
+                              <span class="block text-[11px] text-slate-500 mt-0.5">
+                                Wenn aktiv und die Nachricht nach Datum/Uhrzeit klingt, wird die KI dein Kalenderfenster + Vorlagen-Hinweis bekommen.
+                              </span>
+                            </span>
+                            <span class="switch switch-lg shrink-0">
+                              <input type="checkbox"
+                                     :checked="!!settings.schedule_assist_enabled"
+                                     @change="settings.schedule_assist_enabled = $event.target.checked ? 1 : 0">
+                              <span class="slider"></span>
+                            </span>
+                          </label>
+                          <div>
+                            <label class="text-[10px] uppercase tracking-wider text-slate-400">Vorlage</label>
+                            <select x-model="settings.schedule_assist_template"
+                                    class="mt-1 w-full bg-slate-800 border border-slate-700 rounded-md px-2 py-1.5 text-sm focus:outline-none focus:border-emerald-500">
+                              <option value="free">Freier Vorschlag</option>
+                              <option value="3_concrete_slots">3 konkrete Slots</option>
+                              <option value="ask_daytime">Tageszeit-Rückfrage</option>
+                              <option value="custom">Eigener Prompt</option>
+                            </select>
+                          </div>
+                          <div x-show="settings.schedule_assist_template === 'custom'">
+                            <label class="text-[10px] uppercase tracking-wider text-slate-400">Eigener Prompt</label>
+                            <textarea rows="3" x-model="settings.schedule_assist_prompt"
+                                      placeholder="z.B. 'Schlage 2 Slots am Wochenende vor, vermeide Vormittage'"
+                                      class="mt-1 w-full bg-slate-800 border border-slate-700 rounded-md px-2 py-1.5 text-sm focus:outline-none focus:border-emerald-500 resize-y"></textarea>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                    <!-- end accordion: schedule_assist -->
+
                     <!-- ACCORDION: voice_memory (Voice & Memory) -->
                     <div class="border-b border-slate-800">
                       <button @click="toggleSettingsSection('voice_memory')"
@@ -1369,34 +1511,61 @@
       <!-- View: 📊 Dashboard                                            -->
       <!-- ============================================================ -->
       <section x-show="waStatus !== 'qr' && currentView === 'dashboard'" class="flex-1 flex flex-col min-h-0 overflow-y-auto scroll-pane">
-        <div class="max-w-6xl mx-auto w-full px-6 py-6 space-y-5">
-          <!-- Stats tiles -->
-          <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+        <div class="max-w-6xl mx-auto w-full px-4 md:px-6 py-6 space-y-5">
+          <!-- Stats tiles — 2 cols on mobile, 6 on lg -->
+          <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
             <div class="rounded-md bg-slate-800/60 border border-slate-700/60 px-3 py-2">
               <div class="text-[10px] uppercase tracking-wider text-slate-400">Chats</div>
-              <div class="text-xl font-bold text-slate-100" x-text="stats?.chats_total ?? 0"></div>
+              <template x-if="!stats">
+                <div class="sk sk-line w-12 mt-1 animate-pulse" style="height:1.25rem;"></div>
+              </template>
+              <div x-show="stats" class="text-xl font-bold text-slate-100" x-text="formatNumber(stats?.chats_total ?? 0)"></div>
             </div>
             <div class="rounded-md bg-slate-800/60 border border-slate-700/60 px-3 py-2">
               <div class="text-[10px] uppercase tracking-wider text-slate-400">Auto-Reply</div>
-              <div class="text-xl font-bold text-emerald-400" x-text="stats?.chats_auto ?? 0"></div>
+              <template x-if="!stats">
+                <div class="sk sk-line w-12 mt-1 animate-pulse" style="height:1.25rem;"></div>
+              </template>
+              <div x-show="stats" class="text-xl font-bold text-emerald-400" x-text="formatNumber(stats?.chats_auto ?? 0)"></div>
             </div>
             <div class="rounded-md bg-slate-800/60 border border-slate-700/60 px-3 py-2">
               <div class="text-[10px] uppercase tracking-wider text-slate-400">Pending</div>
-              <div class="text-xl font-bold text-amber-400" x-text="stats?.pending_queue ?? 0"></div>
+              <template x-if="!stats">
+                <div class="sk sk-line w-12 mt-1 animate-pulse" style="height:1.25rem;"></div>
+              </template>
+              <div x-show="stats" class="text-xl font-bold text-amber-400" x-text="formatNumber(stats?.pending_queue ?? 0)"></div>
             </div>
             <div class="rounded-md bg-slate-800/60 border border-slate-700/60 px-3 py-2">
               <div class="text-[10px] uppercase tracking-wider text-slate-400">Auto-Antworten 24h</div>
-              <div class="text-xl font-bold text-blue-400" x-text="stats?.auto_replies_24h ?? 0"></div>
+              <template x-if="!stats">
+                <div class="sk sk-line w-12 mt-1 animate-pulse" style="height:1.25rem;"></div>
+              </template>
+              <div x-show="stats" class="text-xl font-bold text-blue-400" x-text="formatNumber(stats?.auto_replies_24h ?? 0)"></div>
             </div>
             <div class="rounded-md bg-slate-800/60 border border-slate-700/60 px-3 py-2">
               <div class="text-[10px] uppercase tracking-wider text-slate-400">Messages 24h</div>
-              <div class="text-xl font-bold text-slate-100" x-text="stats?.messages_24h ?? 0"></div>
+              <template x-if="!stats">
+                <div class="sk sk-line w-12 mt-1 animate-pulse" style="height:1.25rem;"></div>
+              </template>
+              <div x-show="stats" class="text-xl font-bold text-slate-100" x-text="formatNumber(stats?.messages_24h ?? 0)"></div>
             </div>
             <div class="rounded-md bg-slate-800/60 border border-slate-700/60 px-3 py-2">
               <div class="text-[10px] uppercase tracking-wider text-slate-400">Medien</div>
-              <div class="text-xl font-bold text-slate-100" x-text="stats?.media_total ?? 0"></div>
+              <template x-if="!stats">
+                <div class="sk sk-line w-12 mt-1 animate-pulse" style="height:1.25rem;"></div>
+              </template>
+              <div x-show="stats" class="text-xl font-bold text-slate-100" x-text="formatNumber(stats?.media_total ?? 0)"></div>
             </div>
           </div>
+
+      <!-- Charts placeholder while loading -->
+      <template x-if="!charts">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 animate-pulse">
+          <div class="h-24 sk-dark rounded-md"></div>
+          <div class="h-24 sk-dark rounded-md"></div>
+          <div class="h-24 sk-dark rounded-md"></div>
+        </div>
+      </template>
 
       <!-- Charts row (moved into dashboard view) -->
       <template x-if="charts">
@@ -1581,7 +1750,20 @@
 
           <!-- Empty state -->
           <template x-if="inboxTotalCount() === 0">
-            <div class="text-center text-slate-500 italic py-12">Alles abgearbeitet 🎉</div>
+            <div class="text-center py-16 px-4">
+              <div class="text-5xl mb-3 opacity-70">📭</div>
+              <div class="text-lg font-semibold text-slate-200">Noch nichts hier</div>
+              <div class="text-sm text-slate-400 mt-1.5 max-w-md mx-auto leading-relaxed">
+                Sobald die KI Antwort-Vorschläge oder Bio-Erkenntnisse erzeugt,
+                landen sie hier. Aktiviere Auto-Reply oder den Suggestion-Mode für
+                einen Chat, damit Vorschläge entstehen.
+              </div>
+              <button @click="goView('chats')"
+                      class="mt-5 inline-flex items-center gap-2 px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition">
+                <span>Auto-Reply für einen Chat einschalten</span>
+                <span>→</span>
+              </button>
+            </div>
           </template>
 
           <!-- Antwort-Vorschläge -->
@@ -1693,7 +1875,20 @@
           </template>
 
           <template x-if="!sessionsLoading && sessions.length === 0">
-            <div class="text-center text-slate-500 italic py-12">Noch keine AI-Sessions.</div>
+            <div class="text-center py-14 px-4">
+              <div class="text-5xl mb-3 opacity-70">🎯</div>
+              <div class="text-lg font-semibold text-slate-200">Noch keine AI-Sessions</div>
+              <div class="text-sm text-slate-400 mt-1.5 max-w-md mx-auto leading-relaxed">
+                Eine Session läuft autonom mit einem Ziel — z.B. „Schlag Termine
+                vor und stimm dich ab". Starten kannst du sie im Chat-Detail
+                über den <span class="text-emerald-300">🎯</span>-Button.
+              </div>
+              <button @click="goView('chats')"
+                      class="mt-5 inline-flex items-center gap-2 px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition">
+                <span>Zur Chat-Liste</span>
+                <span>→</span>
+              </button>
+            </div>
           </template>
 
           <!-- Active sessions -->
@@ -1997,6 +2192,11 @@
                     class="px-3 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap">
               🗓 Zeitpläne <span class="text-slate-500" x-text="`(${schedules.length})`"></span>
             </button>
+            <button @click="settingsSubTab = 'calendar'"
+                    :class="settingsSubTab === 'calendar' ? 'border-emerald-500 text-emerald-300' : 'border-transparent text-slate-400 hover:text-slate-200'"
+                    class="px-3 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap">
+              📅 Kalender <span class="text-slate-500" x-text="`(${calendarSources.length})`"></span>
+            </button>
             <button @click="settingsSubTab = 'global'"
                     :class="settingsSubTab === 'global' ? 'border-emerald-500 text-emerald-300' : 'border-transparent text-slate-400 hover:text-slate-200'"
                     class="px-3 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap">
@@ -2204,6 +2404,193 @@
           </div>
         </template>
         <!-- end Schedules sub-tab -->
+
+        <!-- ───────────────────────────────────────────────────────── -->
+        <!-- Sub-tab: 📅 Kalender                                     -->
+        <!-- ───────────────────────────────────────────────────────── -->
+        <template x-if="settingsSubTab === 'calendar'">
+          <div class="px-6 py-5 max-w-6xl mx-auto w-full space-y-5"
+               x-init="loadCalendarSources(); loadCalendarAvailability(); loadAppointments()">
+
+            <!-- Header + add button -->
+            <div class="flex items-center justify-between gap-2">
+              <div>
+                <h2 class="text-base font-semibold">Externe Kalender</h2>
+                <p class="text-[11px] text-slate-500 leading-snug">
+                  Verbinde iCal/.ics-Feeds (Google, iCloud, Outlook). Die KI nutzt freie/belegte Zeiten für Terminvorschläge.
+                </p>
+              </div>
+              <button x-show="!editingCalendarSource" @click="newCalendarSource()"
+                      class="px-3 py-1.5 text-sm rounded bg-emerald-600 hover:bg-emerald-500 font-medium">
+                + Quelle hinzufügen
+              </button>
+            </div>
+
+            <!-- Add/edit form -->
+            <template x-if="editingCalendarSource">
+              <div class="rounded-lg border border-emerald-700/40 bg-emerald-950/20 p-4 space-y-3">
+                <div class="text-sm font-semibold text-emerald-300"
+                     x-text="editingCalendarSource.id ? `Kalender bearbeiten #${editingCalendarSource.id}` : 'Neuer Kalender'"></div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div>
+                    <label class="text-[10px] uppercase tracking-wider text-slate-400">Name</label>
+                    <input type="text" x-model="editingCalendarSource.name"
+                           placeholder="z.B. Privat / Arbeit"
+                           class="mt-1 w-full bg-slate-800 border border-slate-700 rounded-md px-2.5 py-1.5 text-sm focus:outline-none focus:border-emerald-500" />
+                  </div>
+                  <div>
+                    <label class="text-[10px] uppercase tracking-wider text-slate-400">Farbe</label>
+                    <input type="color" x-model="editingCalendarSource.color"
+                           class="mt-1 w-full h-9 bg-slate-800 border border-slate-700 rounded-md cursor-pointer" />
+                  </div>
+                </div>
+                <div>
+                  <label class="text-[10px] uppercase tracking-wider text-slate-400">iCal-URL (https oder webcal)</label>
+                  <input type="text" x-model="editingCalendarSource.ical_url"
+                         placeholder="https://calendar.google.com/calendar/ical/.../basic.ics"
+                         class="mt-1 w-full bg-slate-800 border border-slate-700 rounded-md px-2.5 py-1.5 text-sm font-mono focus:outline-none focus:border-emerald-500" />
+                </div>
+                <label class="flex items-center gap-2 text-xs text-slate-300">
+                  <input type="checkbox" x-model="editingCalendarSource.enabled"
+                         class="rounded bg-slate-800 border-slate-600" />
+                  <span>Aktiviert (wird regelmäßig aktualisiert)</span>
+                </label>
+                <div class="flex items-center justify-end gap-2 pt-1">
+                  <button @click="editingCalendarSource = null"
+                          class="px-3 py-1.5 text-sm rounded bg-slate-800 hover:bg-slate-700 border border-slate-700">
+                    Abbrechen
+                  </button>
+                  <button @click="saveCalendarSource()"
+                          :disabled="calendarSourceSaving"
+                          class="px-3 py-1.5 text-sm rounded bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-900 disabled:text-emerald-300 font-medium">
+                    <span x-text="calendarSourceSaving ? 'Speichere…' : 'Speichern'"></span>
+                  </button>
+                </div>
+              </div>
+            </template>
+
+            <!-- Source list -->
+            <div class="space-y-1.5">
+              <template x-for="s in calendarSources" :key="s.id">
+                <div class="rounded border border-slate-800 bg-slate-950/40 px-3 py-2 flex items-center gap-3">
+                  <span class="w-3 h-3 rounded-full shrink-0" :style="{ background: s.color || '#10b981' }"></span>
+                  <div class="flex-1 min-w-0">
+                    <div class="text-sm font-medium truncate" x-text="s.name"></div>
+                    <div class="text-[10px] text-slate-500 truncate font-mono" x-text="maskUrl(s.ical_url)"></div>
+                    <div class="text-[10px] text-slate-400 mt-0.5 flex items-center gap-2">
+                      <span x-show="s.last_fetched_at" x-text="`Zuletzt: ${formatDateTime(s.last_fetched_at)}`"></span>
+                      <span x-show="!s.last_fetched_at" class="text-slate-500">noch nie geladen</span>
+                      <span x-show="s.last_error" class="text-rose-400" :title="s.last_error" x-text="`· Fehler: ${truncate(s.last_error, 60)}`"></span>
+                    </div>
+                  </div>
+                  <label class="flex items-center gap-1 text-[10px] text-slate-400">
+                    <input type="checkbox" :checked="!!s.enabled" @change="toggleCalendarSourceEnabled(s)"
+                           class="rounded bg-slate-800 border-slate-600">
+                    <span>aktiv</span>
+                  </label>
+                  <button @click="refreshCalendarSource(s)"
+                          :disabled="!!calendarRefreshing[s.id]"
+                          class="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 disabled:opacity-50"
+                          title="Neu laden">
+                    <span x-text="calendarRefreshing[s.id] ? '…' : '↻'"></span>
+                  </button>
+                  <button @click="editCalendarSource(s)"
+                          class="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700"
+                          title="Bearbeiten">✎</button>
+                  <button @click="deleteCalendarSourceClick(s)"
+                          class="text-xs px-2 py-1 rounded bg-rose-700/30 hover:bg-rose-700/50 border border-rose-800 text-rose-200"
+                          title="Löschen">×</button>
+                </div>
+              </template>
+              <div x-show="!calendarSources.length" class="text-xs text-slate-500 text-center py-4">
+                Noch keine Kalender. Klick „+ Quelle hinzufügen".
+              </div>
+            </div>
+
+            <!-- Availability preview heatmap -->
+            <div class="rounded-lg border border-slate-800 bg-slate-950/60 p-4 space-y-2">
+              <div class="flex items-center justify-between">
+                <div class="text-xs font-semibold uppercase tracking-wider text-slate-400">Verfügbarkeit (14 Tage × 24h)</div>
+                <button @click="loadCalendarAvailability()"
+                        class="text-[10px] text-slate-500 hover:text-slate-300">↻ neu</button>
+              </div>
+              <div class="overflow-x-auto">
+                <div class="inline-block">
+                  <div class="flex">
+                    <div class="w-12 shrink-0"></div>
+                    <template x-for="h in 24" :key="h">
+                      <div class="text-[8px] text-slate-500 text-center" style="width:6px"
+                           x-text="(h-1) % 6 === 0 ? (h-1) : ''"></div>
+                    </template>
+                  </div>
+                  <template x-for="(row, dayIdx) in calendarHeatmap" :key="dayIdx">
+                    <div class="flex items-center">
+                      <div class="text-[10px] text-slate-400 pr-1 w-12 shrink-0" x-text="row.label"></div>
+                      <template x-for="(cell, hr) in row.cells" :key="hr">
+                        <div :title="`${row.label} ${hr}:00 — ${cell.label}`"
+                             class="h-3"
+                             :class="cell.kind === 'busy' ? 'bg-red-500/60' : cell.kind === 'free' ? 'bg-emerald-500/30' : 'bg-slate-700/40'"
+                             style="width:6px"></div>
+                      </template>
+                    </div>
+                  </template>
+                </div>
+              </div>
+              <div class="flex items-center gap-3 text-[10px] text-slate-500 pt-1">
+                <span class="flex items-center gap-1"><span class="inline-block w-3 h-2 bg-red-500/60"></span>belegt</span>
+                <span class="flex items-center gap-1"><span class="inline-block w-3 h-2 bg-emerald-500/30"></span>frei (Tagstunden)</span>
+                <span class="flex items-center gap-1"><span class="inline-block w-3 h-2 bg-slate-700/40"></span>Off-Hours</span>
+              </div>
+              <template x-if="calendarAvailability.summary">
+                <pre class="mt-2 text-[11px] text-slate-300 whitespace-pre-wrap font-mono bg-slate-900/60 border border-slate-800 rounded p-2 max-h-48 overflow-y-auto"
+                     x-text="calendarAvailability.summary"></pre>
+              </template>
+            </div>
+
+            <!-- Confirmed appointments -->
+            <div class="rounded-lg border border-slate-800 bg-slate-950/60 p-4 space-y-2">
+              <div class="flex items-center justify-between">
+                <div>
+                  <div class="text-xs font-semibold uppercase tracking-wider text-slate-400">Bestätigte Termine</div>
+                  <div class="text-[10px] text-slate-500" x-text="`${appointments.length} ${appointments.length === 1 ? 'Eintrag' : 'Einträge'}`"></div>
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <button @click="loadAppointments()" class="text-[10px] text-slate-500 hover:text-slate-300">↻</button>
+                  <a :href="appointmentsFeedUrl()" download
+                     class="text-[10px] px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-medium">
+                    ⬇ Alle als ICS-Feed
+                  </a>
+                </div>
+              </div>
+              <div class="space-y-1">
+                <template x-for="a in appointments.slice(0, 5)" :key="a.id">
+                  <div class="flex items-center gap-2 text-xs">
+                    <span class="w-1 h-6 rounded-full"
+                          :class="a.status === 'tentative' ? 'bg-amber-400' : 'bg-emerald-400'"></span>
+                    <div class="flex-1 min-w-0">
+                      <div class="font-medium truncate" x-text="a.title"></div>
+                      <div class="text-[10px] text-slate-500 truncate">
+                        <span x-text="formatDateTime(a.start_ts)"></span> ·
+                        <span x-text="(chatNameById(a.chat_id) || a.chat_id)"></span> ·
+                        <span x-text="a.status"></span>
+                      </div>
+                    </div>
+                    <a :href="`/api/appointments/${a.id}/download.ics`"
+                       class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700"
+                       title="ICS herunterladen">⬇ .ics</a>
+                    <button @click="deleteAppointmentClick(a)"
+                            class="text-[10px] px-1.5 py-0.5 rounded bg-rose-700/30 hover:bg-rose-700/50 border border-rose-800 text-rose-200"
+                            title="Löschen">×</button>
+                  </div>
+                </template>
+                <div x-show="!appointments.length" class="text-xs text-slate-500 text-center py-2">
+                  Noch keine bestätigten Termine.
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
+        <!-- end Calendar sub-tab -->
 
         <!-- ───────────────────────────────────────────────────────── -->
         <!-- Sub-tab: Profile & Calendar                              -->
@@ -2878,28 +3265,61 @@
 
       <!-- Live log (bottom) -->
       <section class="border-t border-slate-800 bg-slate-950 shrink-0">
-        <button @click="logOpen = !logOpen"
-                class="w-full px-4 py-2 flex items-center justify-between text-xs text-slate-400 hover:bg-slate-900/60">
-          <span class="font-semibold uppercase tracking-wider">Live-Log
-            <span class="ml-2 text-slate-500" x-text="`(${logs.length})`"></span>
-          </span>
-          <span x-text="logOpen ? '▾' : '▴'"></span>
-        </button>
+        <div class="w-full px-4 py-2 flex items-center justify-between gap-2 text-xs text-slate-400">
+          <button @click="logOpen = !logOpen"
+                  class="flex items-center gap-2 font-semibold uppercase tracking-wider hover:text-slate-200 transition">
+            <span x-text="logOpen ? '▾' : '▴'"></span>
+            <span>Live-Log</span>
+            <span class="text-slate-500" x-text="`(${logs.length})`"></span>
+          </button>
+          <!-- Filter chips — only visible when log open -->
+          <div class="flex items-center gap-1.5" x-show="logOpen">
+            <template x-for="lvl in ['all','info','warn','error']" :key="lvl">
+              <button @click="logFilter = lvl"
+                      :class="logFilter === lvl
+                        ? 'bg-slate-700 text-slate-100 border-slate-500'
+                        : 'bg-slate-900 text-slate-400 border-slate-700 hover:bg-slate-800 hover:text-slate-200'"
+                      class="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded border transition">
+                <span x-text="lvl"></span>
+                <span class="ml-1 text-slate-500" x-text="`(${logLevelCount(lvl)})`"></span>
+              </button>
+            </template>
+          </div>
+          <!-- Tastatur-Hilfe hint (always visible in footer) -->
+          <button @click="shortcutsHelpOpen = true"
+                  class="hidden md:flex items-center gap-1.5 text-[11px] text-slate-500 hover:text-slate-200 transition"
+                  title="Tastaturkürzel anzeigen (?)">
+            <span>📖</span><span>Tastatur</span>
+            <kbd class="kc">?</kbd>
+          </button>
+        </div>
         <div x-show="logOpen" class="h-48 overflow-y-auto scroll-pane px-4 pb-3 font-mono text-[11px] space-y-0.5">
           <template x-if="logs.length === 0">
             <div class="text-slate-600 italic">Keine Log-Einträge.</div>
           </template>
-          <template x-for="(l, i) in logs" :key="i">
-            <div class="flex gap-2"
-                 :class="{
-                   'text-slate-300': l.level === 'info' || !l.level,
-                   'text-amber-300': l.level === 'warn',
-                   'text-red-400': l.level === 'error',
-                   'text-slate-500': l.level === 'debug'
-                 }">
-              <span class="text-slate-600 shrink-0" x-text="formatTime(l.t)"></span>
-              <span class="uppercase shrink-0 w-12" x-text="l.level || 'info'"></span>
-              <span class="break-all" x-text="l.msg + (l.meta ? ' ' + JSON.stringify(l.meta) : '')"></span>
+          <template x-if="logs.length > 0 && filteredLogs().length === 0">
+            <div class="text-slate-600 italic">Keine Einträge für diesen Filter.</div>
+          </template>
+          <template x-for="row in filteredLogs()" :key="row.idx">
+            <div>
+              <button type="button"
+                      @click="toggleLogExpanded(row.idx)"
+                      class="w-full text-left flex gap-2 hover:bg-slate-900/60 rounded px-1 cursor-pointer"
+                      :class="{
+                        'text-slate-300': row.l.level === 'info' || !row.l.level,
+                        'text-amber-300': row.l.level === 'warn',
+                        'text-red-400': row.l.level === 'error',
+                        'text-slate-500': row.l.level === 'debug'
+                      }">
+                <span class="text-slate-600 shrink-0" x-text="formatTime(row.l.t)"></span>
+                <span class="uppercase shrink-0 w-12" x-text="row.l.level || 'info'"></span>
+                <span class="break-all flex-1" x-text="row.l.msg"></span>
+                <span x-show="row.l.meta" class="text-slate-600 shrink-0"
+                      x-text="expandedLogIdx === row.idx ? '▾' : '▸'"></span>
+              </button>
+              <pre x-show="expandedLogIdx === row.idx && row.l.meta"
+                   class="ml-14 mt-1 mb-1.5 px-2 py-1.5 bg-slate-900/60 border border-slate-800 rounded text-slate-300 whitespace-pre-wrap break-all"
+                   x-text="prettyMeta(row.l.meta)"></pre>
             </div>
           </template>
         </div>
@@ -3016,7 +3436,7 @@
             <template x-if="!storiesLoading && stories.length === 0">
               <div class="text-slate-500 text-sm italic">Keine Stories.</div>
             </template>
-            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
+            <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
               <template x-for="s in stories" :key="s.id">
                 <div class="rounded-lg overflow-hidden border border-slate-800 bg-slate-950">
                   <template x-if="s.media_kind === 'image'">
@@ -3050,15 +3470,65 @@
         <img :src="lightbox" class="max-w-full max-h-full rounded-lg shadow-2xl" />
       </div>
 
-      <!-- Toasts -->
-      <div class="fixed bottom-6 right-6 space-y-2 z-50">
-        <template x-for="t in toasts" :key="t.id">
-          <div x-transition.opacity
-               class="bg-slate-800 border text-slate-100 px-4 py-2 rounded-lg shadow-xl text-sm"
-               :class="t.kind === 'error' ? 'border-red-700 text-red-100' : 'border-emerald-700/50'">
-            <span x-text="t.msg"></span>
+      <!-- Toasts (bottom-right stack, max 4) -->
+      <div class="fixed bottom-6 right-6 space-y-2 z-50 max-w-xs sm:max-w-sm">
+        <template x-for="t in toasts.slice(-4)" :key="t.id">
+          <div x-transition:enter="transition ease-out duration-200"
+               x-transition:enter-start="opacity-0 translate-x-8"
+               x-transition:enter-end="opacity-100 translate-x-0"
+               x-transition:leave="transition ease-in duration-150"
+               x-transition:leave-start="opacity-100 translate-x-0"
+               x-transition:leave-end="opacity-0 translate-x-8"
+               @click="dismissToast(t.id)"
+               class="border px-4 py-2.5 rounded-lg shadow-xl text-sm cursor-pointer select-none transition"
+               :class="toastClasses(t.kind)"
+               role="status"
+               :title="`(klicken zum Schließen) ${t.kind || 'info'}`">
+            <div class="flex items-start gap-2">
+              <span class="shrink-0 mt-0.5" x-text="{
+                success: '✓', error: '⚠', warn: '⚡', warning: '⚡', info: 'ℹ'
+              }[t.kind] || 'ℹ'"></span>
+              <span class="flex-1 break-words" x-text="t.msg"></span>
+            </div>
           </div>
         </template>
+      </div>
+
+      <!-- Keyboard shortcuts cheatsheet modal -->
+      <div x-show="shortcutsHelpOpen" x-transition.opacity x-cloak
+           class="fixed inset-0 z-50 bg-black/60 flex items-start justify-center p-4 pt-16"
+           @keydown.escape.window="shortcutsHelpOpen = false"
+           @click="shortcutsHelpOpen = false">
+        <div class="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-full max-w-md max-h-[85vh] flex flex-col"
+             @click.stop>
+          <div class="px-5 py-4 border-b border-slate-800 flex items-center justify-between">
+            <h2 class="font-semibold flex items-center gap-2">
+              <span>📖</span><span>Tastaturkürzel</span>
+            </h2>
+            <button @click="shortcutsHelpOpen = false"
+                    class="text-slate-400 hover:text-slate-200 text-xl leading-none">×</button>
+          </div>
+          <div class="px-5 py-4 overflow-y-auto scroll-pane">
+            <div class="text-xs text-slate-400 mb-3">
+              Bei „<kbd class="kc">g</kbd> dann <kbd class="kc">…</kbd>" zuerst „g" loslassen und dann den zweiten Buchstaben drücken. Funktioniert nicht, während du in einem Eingabefeld tippst.
+            </div>
+            <ul class="space-y-1.5 text-sm">
+              <template x-for="(s, idx) in shortcutsList()" :key="idx">
+                <li class="flex items-center justify-between gap-3 py-1 border-b border-slate-800/60 last:border-b-0">
+                  <span class="text-slate-200" x-text="s.label"></span>
+                  <span class="flex items-center gap-1 shrink-0">
+                    <template x-for="(k, ki) in s.keys" :key="ki">
+                      <span class="flex items-center gap-1">
+                        <kbd class="kc" x-text="k"></kbd>
+                        <span x-show="ki < s.keys.length - 1" class="text-slate-500 text-xs">+</span>
+                      </span>
+                    </template>
+                  </span>
+                </li>
+              </template>
+            </ul>
+          </div>
+        </div>
       </div>
     </div>
   </body>

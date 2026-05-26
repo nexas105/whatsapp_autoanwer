@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS messages (
   raw_json    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, timestamp DESC);
+-- Perf: speeds up "last reply from me / from them" lookups and stats.
+CREATE INDEX IF NOT EXISTS idx_messages_chat_from_ts ON messages(chat_id, from_me, timestamp DESC);
+-- Perf: ack lookups (read receipts).
+CREATE INDEX IF NOT EXISTS idx_messages_ack ON messages(ack);
+-- Perf: auto-reply counters in dashboard stats / charts.
+CREATE INDEX IF NOT EXISTS idx_messages_isauto_ts ON messages(is_auto, timestamp DESC);
 
 -- Personas: built-in (is_builtin=1, not deletable) + user-created.
 CREATE TABLE IF NOT EXISTS personas (
@@ -62,6 +68,8 @@ CREATE TABLE IF NOT EXISTS reply_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_reply_queue_status ON reply_queue(status, fire_at);
 CREATE INDEX IF NOT EXISTS idx_reply_queue_chat ON reply_queue(chat_id);
+-- Perf: avg response time / metrics windows order by updated_at.
+CREATE INDEX IF NOT EXISTS idx_reply_queue_updated ON reply_queue(updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS analyses (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,6 +128,36 @@ CREATE TABLE IF NOT EXISTS suggestions (
   updated_at     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_suggestions_chat_status ON suggestions(chat_id, status, created_at DESC);
+
+-- External calendar sources (iCal/.ics URLs). Events cached as JSON for offline use.
+CREATE TABLE IF NOT EXISTS calendar_sources (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  name            TEXT NOT NULL,
+  ical_url        TEXT NOT NULL,
+  color           TEXT,
+  enabled         INTEGER NOT NULL DEFAULT 1,
+  last_fetched_at INTEGER,
+  last_error      TEXT,
+  events_json     TEXT,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL
+);
+
+-- Confirmed appointments the bot booked via chat after the other side agreed.
+CREATE TABLE IF NOT EXISTS confirmed_appointments (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id         TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  message_id      TEXT,
+  title           TEXT NOT NULL,
+  notes           TEXT,
+  start_ts        INTEGER NOT NULL,
+  end_ts          INTEGER NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'tentative',
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_appointments_chat ON confirmed_appointments(chat_id, start_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_appointments_start ON confirmed_appointments(status, start_ts);
 
 -- Single-row user profile (the human running the bot). All fields nullable.
 CREATE TABLE IF NOT EXISTS user_profile (

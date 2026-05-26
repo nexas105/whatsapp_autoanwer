@@ -14,6 +14,7 @@ import { buildRestRouter } from './api/rest.js';
 import { attachWs } from './api/ws.js';
 import { installNotifBridge } from './notifs.js';
 import { startBioExtractor } from './bio/extract.js';
+import { startCalendarRefresher } from './calendar/scheduler.js';
 import * as repo from './db/repo.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -41,6 +42,7 @@ async function main() {
 
   const scheduler = startScheduler({ wa });
   startBioExtractor();
+  const calendarRefresher = startCalendarRefresher();
 
   const app = express();
   app.use(express.json({ limit: '1mb' }));
@@ -52,7 +54,7 @@ async function main() {
     if (m && m[1] === config.auth.token) return next();
     return res.status(401).json({ error: 'unauthorized' });
   });
-  app.use('/api', buildRestRouter({ wa, engine, scheduler }));
+  app.use('/api', buildRestRouter({ wa, engine, scheduler, calendarRefresher }));
   app.use(express.static(publicDir));
   app.get('/', (_req, res) => res.sendFile(path.join(publicDir, 'index.html')));
 

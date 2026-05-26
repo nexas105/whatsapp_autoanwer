@@ -14,7 +14,8 @@ function app() {
   const utils = window.AppUtils || {};
   const views = window.AppViews || {};
   const summaries = window.AppSummaries || {};
-  return Object.assign(initialState, utils, views, summaries, {
+  const shortcuts = window.AppShortcuts || {};
+  return Object.assign(initialState, utils, views, summaries, shortcuts, {
     // ────────────────────────────────────────────
     async init() {
       // Load stored dashboard token (Bundle L). Empty string when unset.
@@ -26,7 +27,7 @@ function app() {
           this.currentView = v;
         }
         const sub = localStorage.getItem('settings_sub_tab') || '';
-        if (['profile', 'personas', 'schedules', 'global', 'health', 'playground', 'token'].includes(sub)) {
+        if (['profile', 'personas', 'schedules', 'calendar', 'global', 'health', 'playground', 'token'].includes(sub)) {
           this.settingsSubTab = sub;
         }
       } catch { /* ignore */ }
@@ -77,6 +78,8 @@ function app() {
       this.statsTimer = setInterval(() => this.loadStats(), 30000);
       // refresh charts every 60s
       this.chartsTimer = setInterval(() => this.loadCharts(), 60000);
+      // Global keyboard shortcuts (Cmd/Ctrl+K, g+c, ? etc.)
+      if (typeof this.installShortcuts === 'function') this.installShortcuts();
     },
 
     // ───── API helpers ─────
@@ -179,6 +182,16 @@ function app() {
       this._chartsRefreshTimer = setTimeout(() => {
         this._chartsRefreshTimer = null;
         this.loadCharts();
+      }, 1500);
+    },
+    _statsRefreshTimer: null,
+    // Stats are also hammered by WS events (every incoming message). Coalesce
+    // a burst into one GET on the same 1.5s window as charts.
+    scheduleStatsRefresh() {
+      if (this._statsRefreshTimer) return;
+      this._statsRefreshTimer = setTimeout(() => {
+        this._statsRefreshTimer = null;
+        this.loadStats();
       }, 1500);
     },
     chartsActivityTotal() {
@@ -302,12 +315,54 @@ function app() {
       ];
     },
 
+    // Pagination state for the chat sidebar (first page 50, scroll for more).
+    _chatsLoading: false,
+    _chatsHasMore: true,
+    _chatsPageSize: 50,
     async loadChats() {
+      // Only show the skeleton when there are no chats yet — refreshes shouldn't
+      // wipe the list back to a placeholder.
+      if (!this.chats || this.chats.length === 0) this.chatsLoading = true;
+      this._chatsLoading = true;
       try {
-        const data = await this.api('/api/chats');
+        const data = await this.api(`/api/chats?limit=${this._chatsPageSize}&offset=0`);
         this.chats = data.chats || [];
+        this._chatsHasMore = (data.chats || []).length >= this._chatsPageSize;
       } catch (e) {
         this.toast('Chats laden fehlgeschlagen: ' + e.message, 'error');
+      } finally {
+        this.chatsLoading = false;
+        this._chatsLoading = false;
+      }
+    },
+    async loadMoreChats() {
+      if (this._chatsLoading || !this._chatsHasMore) return;
+      this._chatsLoading = true;
+      try {
+        const offset = this.chats.length;
+        const data = await this.api(`/api/chats?limit=${this._chatsPageSize}&offset=${offset}`);
+        const more = data.chats || [];
+        // De-dup by id (WS may have inserted a chat into the list meanwhile).
+        const seen = new Set(this.chats.map((c) => c.id));
+        for (const c of more) {
+          if (!seen.has(c.id)) this.chats.push(c);
+        }
+        this._chatsHasMore = more.length >= this._chatsPageSize;
+      } catch (e) {
+        // Silent on infinite-scroll failures — user can retry by scrolling.
+        console.warn('loadMoreChats failed', e);
+      } finally {
+        this._chatsLoading = false;
+      }
+    },
+    // Vanilla scroll handler for the chat sidebar — triggers paging when
+    // the user is within 120px of the bottom of the list. Wired to the
+    // `.scroll-pane` div via @scroll in index.html.
+    onChatsScroll(evt) {
+      const el = evt && evt.target;
+      if (!el || typeof el.scrollTop !== 'number') return;
+      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 120) {
+        this.loadMoreChats();
       }
     },
     sortedChats() {
@@ -365,13 +420,66 @@ function app() {
     },
 
     async loadMessages() {
+      this.messagesLoading = true;
+      this._olderMessagesExhausted = false;
+      this._olderMessagesLoading = false;
       try {
         const data = await this.api(this.chatPath(this.selectedChatId, '/messages?limit=100'));
         // server returns newest first; reverse for chronological display
         this.messages = (data.messages || []).slice().reverse();
+        // Fewer than the requested page → we've already hit the start.
+        if ((data.messages || []).length < 100) this._olderMessagesExhausted = true;
       } catch (e) {
         this.messages = [];
+      } finally {
+        this.messagesLoading = false;
       }
+    },
+    // Cursor-based "load older" — uses ?before_ts=<oldest current ts>.
+    // Returns prepended rows so the on-screen list grows upward.
+    _olderMessagesLoading: false,
+    _olderMessagesExhausted: false,
+    async loadOlderMessages() {
+      if (!this.selectedChatId) return;
+      if (this._olderMessagesLoading || this._olderMessagesExhausted) return;
+      if (!this.messages || this.messages.length === 0) return;
+      const oldestTs = this.messages[0]?.timestamp;
+      if (!oldestTs) return;
+      this._olderMessagesLoading = true;
+      // Preserve scroll position: remember height now, restore delta after prepend.
+      const list = this.$refs && this.$refs.messageList ? this.$refs.messageList : null;
+      const prevHeight = list ? list.scrollHeight : 0;
+      const prevTop = list ? list.scrollTop : 0;
+      try {
+        const PAGE = 50;
+        const data = await this.api(
+          this.chatPath(this.selectedChatId, `/messages?limit=${PAGE}&before_ts=${oldestTs}`)
+        );
+        const older = (data.messages || []).slice().reverse(); // chronological
+        if (older.length < PAGE) this._olderMessagesExhausted = true;
+        if (older.length) {
+          // De-dup against current list head.
+          const have = new Set(this.messages.map((m) => m.id));
+          const fresh = older.filter((m) => !have.has(m.id));
+          this.messages = fresh.concat(this.messages);
+          this.$nextTick(() => {
+            if (!list) return;
+            const delta = list.scrollHeight - prevHeight;
+            list.scrollTop = prevTop + delta;
+          });
+        }
+      } catch (e) {
+        console.warn('loadOlderMessages failed', e);
+      } finally {
+        this._olderMessagesLoading = false;
+      }
+    },
+    // When user scrolls within ~40px of the top of the messages pane, load
+    // an older page. Throttled by the `_olderMessagesLoading` guard.
+    onMessagesScroll(evt) {
+      const el = evt && evt.target;
+      if (!el) return;
+      if (el.scrollTop <= 40) this.loadOlderMessages();
     },
     async loadSettings() {
       try {
@@ -821,7 +929,8 @@ function app() {
           break;
         case 'message':
           this.onWsMessage(msg);
-          this.loadStats();
+          // Coalesce bursts of incoming messages into a single stats/charts GET.
+          this.scheduleStatsRefresh();
           this.scheduleChartsRefresh();
           break;
         case 'queue':
@@ -831,7 +940,7 @@ function app() {
           if (this.pendingReply && this.pendingReply.jobId === msg.jobId) {
             this.pendingReply = null;
           }
-          this.loadStats();
+          this.scheduleStatsRefresh();
           this.scheduleChartsRefresh();
           break;
         case 'settings':
@@ -891,6 +1000,13 @@ function app() {
         case 'schedule':
           this.loadSchedules();
           break;
+        case 'calendar_source':
+          this.loadCalendarSources();
+          if (this.settingsSubTab === 'calendar') this.loadCalendarAvailability();
+          break;
+        case 'appointment':
+          this.loadAppointments();
+          break;
         case 'safety':
           this.onWsSafety(msg);
           break;
@@ -922,6 +1038,12 @@ function app() {
           break;
         case 'log':
           this.pushLog(msg);
+          break;
+        case 'log_batch':
+          // Coalesced log messages from src/api/ws.js — unpack and forward.
+          if (Array.isArray(msg.events)) {
+            for (const ev of msg.events) this.pushLog(ev);
+          }
           break;
         default:
           break;
@@ -2535,7 +2657,243 @@ function app() {
       this.selectChat(s.chat_id);
     },
 
+    // ───── log helpers (filter + expand) ─────
+    // Returns the log entries matching the current `logFilter`. We tag each
+    // with its original index so the template can toggle expansion correctly.
+    filteredLogs() {
+      const f = this.logFilter || 'all';
+      const out = [];
+      for (let i = 0; i < this.logs.length; i += 1) {
+        const l = this.logs[i];
+        const lvl = l.level || 'info';
+        if (f === 'all' || lvl === f) out.push({ idx: i, l });
+      }
+      return out;
+    },
+    logLevelCount(level) {
+      if (level === 'all') return this.logs.length;
+      return this.logs.filter((l) => (l.level || 'info') === level).length;
+    },
+    toggleLogExpanded(idx) {
+      this.expandedLogIdx = (this.expandedLogIdx === idx) ? -1 : idx;
+    },
+    prettyMeta(meta) {
+      if (meta === null || meta === undefined) return '';
+      try {
+        if (typeof meta === 'string') {
+          // Try to parse — if it's a JSON string, format it; else show as-is.
+          try { return JSON.stringify(JSON.parse(meta), null, 2); }
+          catch (_) { return meta; }
+        }
+        return JSON.stringify(meta, null, 2);
+      } catch (_) { return String(meta); }
+    },
+
     // toast(), showToast() — moved to js/utils.js
+
+    // ═════════════════════════════════════════════════════════════
+    // ───── 📅 Calendar sources + appointments ─────
+    // ═════════════════════════════════════════════════════════════
+    async loadCalendarSources() {
+      try {
+        const data = await this.api('/api/calendar/sources');
+        this.calendarSources = Array.isArray(data?.sources) ? data.sources : [];
+      } catch (e) {
+        console.warn('calendar sources fetch failed', e);
+        this.calendarSources = [];
+      }
+    },
+
+    newCalendarSource() {
+      this.editingCalendarSource = {
+        id: null,
+        name: '',
+        ical_url: '',
+        color: '#10b981',
+        enabled: true,
+      };
+    },
+
+    editCalendarSource(s) {
+      this.editingCalendarSource = {
+        id: s.id,
+        name: s.name || '',
+        ical_url: s.ical_url || '',
+        color: s.color || '#10b981',
+        enabled: !!s.enabled,
+      };
+    },
+
+    async saveCalendarSource() {
+      if (!this.editingCalendarSource) return;
+      const s = this.editingCalendarSource;
+      const name = String(s.name || '').trim();
+      if (!name) { this.toast('Name fehlt', 'error'); return; }
+      const url = String(s.ical_url || '').trim();
+      if (!url) { this.toast('iCal-URL fehlt', 'error'); return; }
+      const body = { name, ical_url: url, color: s.color || null, enabled: !!s.enabled };
+      this.calendarSourceSaving = true;
+      try {
+        if (s.id) {
+          await this.api('/api/calendar/sources/' + encodeURIComponent(s.id), {
+            method: 'PUT', body: JSON.stringify(body),
+          });
+          this.toast('Kalender aktualisiert');
+        } else {
+          await this.api('/api/calendar/sources', {
+            method: 'POST', body: JSON.stringify(body),
+          });
+          this.toast('Kalender hinzugefügt — wird im Hintergrund geladen');
+        }
+        this.editingCalendarSource = null;
+        await this.loadCalendarSources();
+      } catch (err) {
+        this.toast('Speichern fehlgeschlagen: ' + err.message, 'error');
+      } finally {
+        this.calendarSourceSaving = false;
+      }
+    },
+
+    async toggleCalendarSourceEnabled(s) {
+      if (!s || !s.id) return;
+      try {
+        await this.api('/api/calendar/sources/' + encodeURIComponent(s.id), {
+          method: 'PUT',
+          body: JSON.stringify({ enabled: !s.enabled }),
+        });
+        await this.loadCalendarSources();
+      } catch (err) {
+        this.toast('Update fehlgeschlagen: ' + err.message, 'error');
+      }
+    },
+
+    async refreshCalendarSource(s) {
+      if (!s || !s.id) return;
+      this.calendarRefreshing = { ...this.calendarRefreshing, [s.id]: true };
+      try {
+        await this.api('/api/calendar/sources/' + encodeURIComponent(s.id) + '/refresh', {
+          method: 'POST',
+        });
+        await this.loadCalendarSources();
+        await this.loadCalendarAvailability();
+      } catch (err) {
+        this.toast('Refresh fehlgeschlagen: ' + err.message, 'error');
+      } finally {
+        const next = { ...this.calendarRefreshing };
+        delete next[s.id];
+        this.calendarRefreshing = next;
+      }
+    },
+
+    async deleteCalendarSourceClick(s) {
+      if (!s || !s.id) return;
+      if (!window.confirm(`Kalender "${s.name}" löschen?`)) return;
+      try {
+        await this.api('/api/calendar/sources/' + encodeURIComponent(s.id), { method: 'DELETE' });
+        this.toast('Kalender gelöscht');
+        await this.loadCalendarSources();
+        await this.loadCalendarAvailability();
+      } catch (err) {
+        this.toast('Löschen fehlgeschlagen: ' + err.message, 'error');
+      }
+    },
+
+    maskUrl(url) {
+      if (!url) return '';
+      const s = String(url);
+      if (s.length <= 60) return s;
+      return s.slice(0, 32) + '…' + s.slice(-20);
+    },
+
+    async loadCalendarAvailability() {
+      try {
+        const data = await this.api('/api/calendar/availability?days=14&dayStart=09:00&dayEnd=21:00');
+        this.calendarAvailability = data || { busy: [], free: [], summary: '', from: 0, to: 0 };
+        this._buildCalendarHeatmap();
+      } catch (e) {
+        console.warn('availability fetch failed', e);
+        this.calendarAvailability = { busy: [], free: [], summary: '', from: 0, to: 0 };
+        this.calendarHeatmap = [];
+      }
+    },
+
+    _buildCalendarHeatmap() {
+      const a = this.calendarAvailability || {};
+      const from = Number(a.from) || 0;
+      const days = 14;
+      if (!from) { this.calendarHeatmap = []; return; }
+      // Business hours: 9-21
+      const bh = (h) => h >= 9 && h < 21;
+      const dayMs = 24 * 3600 * 1000;
+      const hourMs = 3600 * 1000;
+      const SHORT_DOW = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+      const rows = [];
+      for (let d = 0; d < days; d++) {
+        const dayStart = from + d * dayMs;
+        const dayEnd = dayStart + dayMs;
+        const dt = new Date(dayStart);
+        const cells = [];
+        for (let h = 0; h < 24; h++) {
+          const cellStart = dayStart + h * hourMs;
+          const cellEnd = cellStart + hourMs;
+          // Determine busy?
+          let isBusy = false;
+          for (const b of (a.busy || [])) {
+            if (b.end_ts > cellStart && b.start_ts < cellEnd) { isBusy = true; break; }
+          }
+          let kind = isBusy ? 'busy' : (bh(h) ? 'free' : 'off');
+          const startLabel = `${String(h).padStart(2, '0')}:00`;
+          const endLabel = `${String((h + 1) % 24).padStart(2, '0')}:00`;
+          cells.push({ kind, label: `${startLabel}–${endLabel} (${kind})` });
+        }
+        rows.push({
+          label: `${SHORT_DOW[dt.getDay()]} ${dt.getDate()}.${dt.getMonth() + 1}.`,
+          cells,
+        });
+        void dayEnd;
+      }
+      this.calendarHeatmap = rows;
+    },
+
+    chatNameById(chatId) {
+      if (!chatId) return '';
+      const c = (this.chats || []).find((x) => x.id === chatId);
+      return c ? (c.name || chatId) : chatId;
+    },
+
+    async loadAppointments() {
+      try {
+        const since = Date.now() - 24 * 3600 * 1000;
+        const data = await this.api('/api/appointments?since=' + since + '&limit=100');
+        this.appointments = Array.isArray(data?.appointments) ? data.appointments : [];
+      } catch (e) {
+        console.warn('appointments fetch failed', e);
+        this.appointments = [];
+      }
+    },
+
+    appointmentsFeedUrl() {
+      // Direct download — needs no JS auth header (the server gates /api on
+      // bearer token, but the link still works for unauthed dev/local setups).
+      // For token-gated setups the user copies the URL into a calendar client
+      // that supports Bearer headers.
+      const since = 'now';
+      let url = '/api/appointments.ics?since=' + since;
+      if (this.token) url += '&token=' + encodeURIComponent(this.token);
+      return url;
+    },
+
+    async deleteAppointmentClick(a) {
+      if (!a || !a.id) return;
+      if (!window.confirm(`Termin "${a.title}" löschen?`)) return;
+      try {
+        await this.api('/api/appointments/' + encodeURIComponent(a.id), { method: 'DELETE' });
+        this.toast('Termin gelöscht');
+        await this.loadAppointments();
+      } catch (err) {
+        this.toast('Löschen fehlgeschlagen: ' + err.message, 'error');
+      }
+    },
   });
 }
 

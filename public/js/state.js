@@ -141,8 +141,17 @@
       // ───── log + ui ─────
       logs: [],
       logOpen: false,
+      logFilter: 'all', // 'all' | 'info' | 'warn' | 'error'
+      expandedLogIdx: -1, // index of the log entry whose meta is expanded
       toasts: [],
       _toastId: 0,
+
+      // ───── loading state (skeletons) ─────
+      chatsLoading: false,
+      messagesLoading: false,
+
+      // ───── keyboard shortcuts (filled by shortcuts.js) ─────
+      shortcutsHelpOpen: false,
 
       // ───── view routing (UI restructure) ─────
       currentView: 'chats',
@@ -233,6 +242,15 @@
       sessionDraft: { initial_prompt: '', max_turns: 20, stop_keywords: '' },
       activeSession: null,
       sessionStarting: false,
+
+      // ───── calendar sources + appointments ─────
+      calendarSources: [],
+      editingCalendarSource: null,
+      calendarSourceSaving: false,
+      calendarRefreshing: {},   // sourceId -> bool
+      calendarAvailability: { busy: [], free: [], summary: '', from: 0, to: 0 },
+      calendarHeatmap: [],      // [{label, cells:[{kind, label}]}, ...]
+      appointments: [],
 
       // simple debounce holders
       _styleSaveTimer: null,

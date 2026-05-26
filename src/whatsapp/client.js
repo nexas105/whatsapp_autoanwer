@@ -194,23 +194,39 @@ export async function startWhatsApp() {
       });
 
       // Auto-transcribe voice notes / audio so the AI has the text in context.
+      // After transcription, RE-EMIT a complete 'message' payload so the
+      // engine's onIncoming path actually fires (which it didn't before, when
+      // the audio first arrived with empty body and no transcript yet).
       if (kind === 'audio' && config.voice.autoTranscribe && transcribeAvailable()) {
-        // Fire-and-forget; persistence + WS event happen when whisper returns.
         transcribeFile(absolutePath)
           .then((transcript) => {
             if (transcript) {
               setMessageTranscript(messageId, transcript);
               bus.emit('transcript', { chatId, messageId, mediaId: mediaRowId, transcript });
+              // Full message payload so server.js's `from_me === 0` gate passes
+              // and engine.onIncoming sees a non-empty `text` (via transcript).
               bus.emit('message', {
                 chatId,
-                message: { id: messageId, chat_id: chatId, transcript, has_media: 1 },
+                message: {
+                  id: messageId,
+                  chat_id: chatId,
+                  from_me: 0,
+                  body: null,
+                  type: msg.type ?? 'ptt',
+                  timestamp,
+                  has_media: 1,
+                  transcript,
+                  _retrigger: true,
+                },
               });
             }
           })
           .catch((err) => log('error', 'transcribe failed', { messageId, error: String(err) }));
       }
 
-      // Auto-analyze images so the AI has a short description in context.
+      // Auto-analyze images. Same pattern as audio above — re-emit full
+      // message so engine.onIncoming actually fires once the description
+      // is available.
       if (kind === 'image' && config.vision?.autoAnalyze && visionAvailable()) {
         analyzeImage(absolutePath, { timeoutMs: config.vision.timeoutMs })
           .then((desc) => {
@@ -219,7 +235,17 @@ export async function startWhatsApp() {
               bus.emit('transcript', { chatId, messageId, mediaId: mediaRowId, transcript: desc, kind: 'image' });
               bus.emit('message', {
                 chatId,
-                message: { id: messageId, chat_id: chatId, transcript: desc, has_media: 1 },
+                message: {
+                  id: messageId,
+                  chat_id: chatId,
+                  from_me: 0,
+                  body: null,
+                  type: msg.type ?? 'image',
+                  timestamp,
+                  has_media: 1,
+                  transcript: desc,
+                  _retrigger: true,
+                },
               });
             }
           })

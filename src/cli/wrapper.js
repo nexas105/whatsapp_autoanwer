@@ -1,7 +1,7 @@
 // Generic AI CLI wrapper.
 //
 // Contract:
-//   export async function runAi(prompt: string, opts?: { timeoutMs?: number, system?: string }) -> string
+//   export async function runAi(prompt: string, opts?: { timeoutMs?: number, system?: string, model?: string }) -> string
 //
 // Behavior:
 // - Reads config.ai = { cmd, args, promptMode: 'stdin'|'arg', timeoutMs }.
@@ -16,6 +16,12 @@
 // - `system` option: optional system-prompt-style preamble. Combine as
 //   `${system}\n\n${prompt}` before sending. The CLI knows nothing about roles; we just
 //   inline the system text.
+//
+// - `model` option: per-call override of the CLI --model flag. Common values
+//   for the Claude Code CLI: 'sonnet' (default for quality), 'haiku' (3-4×
+//   faster for short replies / classification), 'opus'. When set we replace
+//   the existing --model <X> pair in args, or append --model <X> if absent.
+//   We don't gate on a fixed allowlist — the CLI itself rejects bad names.
 
 import { spawn } from 'node:child_process';
 import { config } from '../config.js';
@@ -76,9 +82,24 @@ async function runAiOnce(prompt, opts = {}) {
   const mode = config.ai.promptMode === 'arg' ? 'arg' : 'stdin';
   const timeoutMs = opts.timeoutMs ?? config.ai.timeoutMs;
 
+  // Per-call model override. Replace the existing --model <X> pair if present;
+  // otherwise append --model <X>. We accept any non-empty string and let the
+  // CLI itself reject unsupported model names.
+  const modelOverride = typeof opts.model === 'string' && opts.model.trim()
+    ? opts.model.trim()
+    : null;
+  if (modelOverride) {
+    const idx = baseArgs.indexOf('--model');
+    if (idx >= 0 && idx + 1 < baseArgs.length) {
+      baseArgs[idx + 1] = modelOverride;
+    } else {
+      baseArgs.push('--model', modelOverride);
+    }
+  }
+
   const argv = mode === 'arg' ? [...baseArgs, finalPrompt] : baseArgs;
 
-  log('info', 'ai-cli call', { cmd, mode, len: finalPrompt.length });
+  log('info', 'ai-cli call', { cmd, mode, len: finalPrompt.length, model: modelOverride || undefined });
 
   return await new Promise((resolve, reject) => {
     let child;

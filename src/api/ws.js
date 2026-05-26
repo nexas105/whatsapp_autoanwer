@@ -54,6 +54,49 @@ export function attachWs(server) {
     }
   }
 
+  // ── Event coalescer ─────────────────────────────────────────────────
+  // For very bursty event types we accumulate events in a small buffer and
+  // flush them as a single {type:'<X>_batch', events:[...]} message after a
+  // short window. Currently only `log` is coalesced — it's by far the
+  // chattiest channel during AI runs, and clients (the dashboard log pane)
+  // don't care about exact inter-arrival timing. `message` is intentionally
+  // NOT coalesced to preserve per-message UI animations and ordering.
+  const COALESCE_FLUSH_MS = 80;
+  const COALESCE_THRESHOLD = 5;
+  const coalesceState = new Map(); // type -> { buf: [], timer: Timeout|null }
+
+  function flushCoalesced(type) {
+    const st = coalesceState.get(type);
+    if (!st) return;
+    if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+    const events = st.buf;
+    st.buf = [];
+    if (!events.length) return;
+    if (events.length === 1) {
+      // Single event in the window — keep original shape, no batch overhead.
+      broadcast(events[0]);
+    } else {
+      broadcast({ type: `${type}_batch`, events });
+    }
+  }
+
+  function broadcastCoalesced(type, payload) {
+    let st = coalesceState.get(type);
+    if (!st) {
+      st = { buf: [], timer: null };
+      coalesceState.set(type, st);
+    }
+    st.buf.push(payload);
+    // Flush immediately if we've crossed the burst threshold.
+    if (st.buf.length >= COALESCE_THRESHOLD) {
+      flushCoalesced(type);
+      return;
+    }
+    if (!st.timer) {
+      st.timer = setTimeout(() => flushCoalesced(type), COALESCE_FLUSH_MS);
+    }
+  }
+
   // Bus -> WS forwarding.
   const listeners = [
     ['qr',           ({ qr }) => broadcast({ type: 'qr', qr })],
@@ -64,7 +107,7 @@ export function attachWs(server) {
     ['reply_sent',   ({ chatId, jobId, body }) => broadcast({ type: 'reply_sent', chatId, jobId, body })],
     ['settings',     ({ chatId, settings }) => broadcast({ type: 'settings', chatId, settings })],
     ['analysis',     ({ chatId, analysis }) => broadcast({ type: 'analysis', chatId, analysis })],
-    ['log',          ({ level, msg, meta, t }) => broadcast({ type: 'log', level, msg, meta, t })],
+    ['log',          ({ level, msg, meta, t }) => broadcastCoalesced('log', { type: 'log', level, msg, meta, t })],
     ['media',        ({ chatId, media }) => broadcast({ type: 'media', chatId, media })],
     ['personas',     ({ action, persona, id }) => broadcast({ type: 'personas', action, persona, id })],
     ['sync',         (payload) => broadcast({ type: 'sync', ...payload })],
@@ -86,6 +129,8 @@ export function attachWs(server) {
     ['ai_session',           (payload) => broadcast({ type: 'ai_session', ...payload })],
     ['summary',              (payload) => broadcast({ type: 'summary', ...payload })],
     ['summary_folder',       (payload) => broadcast({ type: 'summary_folder', ...payload })],
+    ['calendar_source',      (payload) => broadcast({ type: 'calendar_source', ...payload })],
+    ['appointment',          (payload) => broadcast({ type: 'appointment', ...payload })],
   ];
 
   for (const [event, handler] of listeners) {
@@ -133,6 +178,12 @@ export function attachWs(server) {
 
   wss.on('close', () => {
     clearInterval(heartbeat);
+    // Flush + clear any pending coalescer timers so we don't leak.
+    for (const type of coalesceState.keys()) {
+      const st = coalesceState.get(type);
+      if (st && st.timer) { clearTimeout(st.timer); st.timer = null; }
+    }
+    coalesceState.clear();
     for (const [event, handler] of listeners) {
       bus.off(event, handler);
     }

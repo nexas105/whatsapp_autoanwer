@@ -41,6 +41,8 @@ function formatTranscript(chat, messages) {
 }
 
 // Map style-mimic strength (0..100) to a sample size + instruction strength.
+// Sample size is capped at 12 — the marginal quality gain from 12→20 examples
+// is negligible but the token cost roughly doubles. See AI-quality notes.
 function styleConfigFor(strength) {
   const s = Math.max(0, Math.min(100, Number(strength) || 0));
   if (s === 0) return { sampleSize: 0, instruction: null };
@@ -52,18 +54,18 @@ function styleConfigFor(strength) {
   }
   if (s < 50) {
     return {
-      sampleSize: 10,
+      sampleSize: 8,
       instruction: 'Schreib in einem Stil, der zu meinen sonstigen Nachrichten passt (Länge, Wortwahl, Groß-/Kleinschreibung).',
     };
   }
   if (s < 75) {
     return {
-      sampleSize: 15,
+      sampleSize: 10,
       instruction: 'Halte dich klar an meinen üblichen Schreibstil: Länge, Wortwahl, Satzbau, Emoji-Häufigkeit, Groß-/Kleinschreibung. Die Persona definiert nur den Ton.',
     };
   }
   return {
-    sampleSize: 20,
+    sampleSize: 12,
     instruction: 'Kopiere meinen Schreibstil so genau wie möglich: Länge, Wortwahl, typische Phrasen, Satzbau, Groß-/Kleinschreibung, Emoji-Häufigkeit, typische Tippfehler. Die Persona gibt nur die Tonrichtung vor — der Stil ist meiner.',
   };
 }
@@ -87,8 +89,14 @@ function relatedContextBlock(chat, messages) {
   const hits = repo.searchMessages(queryText, { limit: 8 })
     // Exclude messages from THIS chat — UI shows them anyway; cross-chat is the new signal.
     .filter((h) => h.chat_id !== chat?.id)
+    // bm25 returns negative scores; lower (more negative) = better match.
+    // Drop hits where the match is weak (score > -2) to avoid stuffing the
+    // prompt with low-signal noise that costs tokens for no benefit.
+    .filter((h) => typeof h.score !== 'number' || h.score <= -2)
     .slice(0, 3);
-  if (!hits.length) return null;
+  // Only include the block when we have at least 2 high-relevance hits —
+  // a single weak match isn't worth the prompt real estate.
+  if (hits.length < 2) return null;
 
   const lines = ['--- Verwandter Kontext aus anderen Chats ---'];
   for (const h of hits) {
@@ -265,8 +273,8 @@ export function buildReplyPrompt(chat, messages, settingsOrPersonaPrompt) {
   }
 
   parts.push(`Du bist ${userLabel}. Antworte als Nutzer auf den letzten Chatverlauf.`);
-  parts.push('Schreibe NUR die nächste Nachricht — kein Zitat, kein Vorwort, keine Erklärungen, keine Anführungszeichen.');
-  parts.push('Behalte Sprache, Ton und Länge des Verlaufs bei.');
+  // Single combined guidance line — was previously two lines; merged to trim tokens.
+  parts.push('Schreibe NUR die nächste Nachricht (kein Zitat, kein Vorwort, keine Anführungszeichen) und behalte Sprache, Ton und Länge des Verlaufs bei.');
   parts.push('');
   parts.push('--- Verlauf ---');
   parts.push(transcript);
@@ -480,7 +488,8 @@ export async function analyzeChat(chatId) {
   const prompt = buildAnalysisPrompt(chat, messages);
   let raw;
   try {
-    raw = await runAi(prompt, { timeoutMs: 120000 });
+    // Chat-Analyse braucht strategisches Verständnis → Opus statt Sonnet.
+    raw = await runAi(prompt, { timeoutMs: 120000, model: 'opus' });
   } catch (err) {
     log('error', 'analyzeChat ai call failed', { chatId, error: String(err) });
     throw err;
