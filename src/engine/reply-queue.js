@@ -536,18 +536,10 @@ export function startEngine({ wa }) {
     try { repo.recordManualReply(chatId); } catch (err) {
       log('warn', 'recordManualReply failed', { chatId, error: String(err) });
     }
-    // If an AI-session is active for this chat, end it — user has taken over.
-    try {
-      const activeSess = repo.getActiveSessionForChat(chatId);
-      if (activeSess) {
-        repo.endAiSession(activeSess.id, 'user_replied');
-        bus.emit('ai_session', { chatId, action: 'ended', session: repo.getAiSession(activeSess.id) });
-        log('info', 'ai-session ended by user_replied', { chatId, sessionId: activeSess.id });
-      }
-    } catch (err) {
-      log('warn', 'ai-session end-on-user-reply failed', { chatId, error: String(err) });
-    }
-    log('info', 'user self-reply cancelled auto-reply', { chatId });
+    // AI-sessions explicitly survive manual phone replies: the user opted into
+    // the goal-driven dialog, so a one-off chime-in shouldn't kill it. Only
+    // the explicit Stop button / max_turns / stop_keyword / AI-DONE end a session.
+    log('info', 'user self-reply cancelled pending auto-reply', { chatId });
   }
 
   function status() {

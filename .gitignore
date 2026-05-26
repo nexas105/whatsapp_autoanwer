@@ -42,3 +42,4 @@ Thumbs.db
 *.key
 *.crt
 *.p12
+.code-review-graph
